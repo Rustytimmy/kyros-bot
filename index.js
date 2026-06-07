@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits } = require('discord.js');
+const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } = require('discord.js');
 const fs = require('fs');
 
 const client = new Client({
@@ -9,10 +9,10 @@ const client = new Client({
     GatewayIntentBits.MessageContent,
   ]
 });
+
 const TOKEN = process.env.TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const DAYS = 30;
 const GATE_HOURS = 24;
 const DB_FILE = 'pending.json';
 const COOLDOWN_SECONDS = 10;
@@ -43,8 +43,24 @@ async function scheduleKick(userId, remaining) {
   }, remaining);
 }
 
+const commands = [
+  new SlashCommandBuilder()
+    .setName('nuke')
+    .setDescription('Kick inactive members')
+    .addIntegerOption(option =>
+      option.setName('days')
+        .setDescription('Days of inactivity')
+        .setRequired(true))
+    .toJSON()
+];
+
+const rest = new REST({ version: '10' }).setToken(TOKEN);
+
 client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`);
+
+  // Register slash commands
+  await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
 
   // Resume pending gate checks from before restart
   const pending = loadPending();
@@ -67,42 +83,6 @@ client.once('clientReady', async () => {
     }
   }
   savePending(pending);
-
-  // One-time nuke of inactives
-  const guild = await client.guilds.fetch(GUILD_ID);
-  const members = await guild.members.fetch();
-  const cutoff = Date.now() - DAYS * 24 * 60 * 60 * 1000;
-  const channels = guild.channels.cache.filter(c => c.isTextBased());
-
-  const lastSeen = new Map();
-  for (const [, channel] of channels) {
-    try {
-      const messages = await channel.messages.fetch({ limit: 100 });
-      for (const [, msg] of messages) {
-        if (msg.author.bot) continue;
-        const prev = lastSeen.get(msg.author.id) || 0;
-        if (msg.createdTimestamp > prev) {
-          lastSeen.set(msg.author.id, msg.createdTimestamp);
-        }
-      }
-    } catch {}
-  }
-
-  let kicked = 0;
-  for (const [id, member] of members) {
-    if (member.user.bot) continue;
-    const seen = lastSeen.get(id) || 0;
-    if (seen < cutoff) {
-      try {
-        await member.kick(`Inactive for ${DAYS}+ days`);
-        console.log(`Nuked: ${member.user.tag}`);
-        kicked++;
-      } catch (e) {
-        console.log(`Skipped ${member.user.tag}: ${e.message}`);
-      }
-    }
-  }
-  console.log(`Nuke done. Kicked ${kicked} inactive members.`);
 });
 
 // Track new members
@@ -125,12 +105,58 @@ client.on('guildMemberUpdate', (oldMember, newMember) => {
   }
 });
 
+// Nuke slash command
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+  if (interaction.commandName !== 'nuke') return;
+
+  if (!interaction.member.permissions.has('KickMembers')) {
+    return interaction.reply({ content: 'You do not have permission to do this.', ephemeral: true });
+  }
+
+  await interaction.reply('Scanning for inactives...');
+
+  const days = interaction.options.getInteger('days');
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  const guild = interaction.guild;
+  const members = await guild.members.fetch();
+  const channels = guild.channels.cache.filter(c => c.isTextBased());
+
+  const lastSeen = new Map();
+  for (const [, channel] of channels) {
+    try {
+      const messages = await channel.messages.fetch({ limit: 100 });
+      for (const [, msg] of messages) {
+        if (msg.author.bot) continue;
+        const prev = lastSeen.get(msg.author.id) || 0;
+        if (msg.createdTimestamp > prev) {
+          lastSeen.set(msg.author.id, msg.createdTimestamp);
+        }
+      }
+    } catch {}
+  }
+
+  let kicked = 0;
+  for (const [id, member] of members) {
+    if (member.user.bot) continue;
+    if (!guild.members.me.permissions.has('KickMembers')) continue;
+    const seen = lastSeen.get(id) || 0;
+    if (seen < cutoff) {
+      try {
+        await member.kick(`Inactive for ${days}+ days`);
+        kicked++;
+      } catch {}
+    }
+  }
+
+  await interaction.editReply(`Done. Kicked ${kicked} inactive members.`);
+});
+
 // AI responses
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
   if (!message.mentions.has(client.user)) return;
 
-  // Rate limit
   const now = Date.now();
   const last = cooldowns.get(message.author.id) || 0;
   if (now - last < COOLDOWN_SECONDS * 1000) {
