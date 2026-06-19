@@ -1,5 +1,7 @@
-const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const fs = require('fs');
+const http = require('http');
+const crypto = require('crypto');
 
 const client = new Client({
   intents: [
@@ -14,116 +16,257 @@ const TOKEN = process.env.TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY;
+const X_CLIENT_ID = process.env.X_CLIENT_ID;
+const X_CLIENT_SECRET = process.env.X_CLIENT_SECRET;
+const X_BEARER_TOKEN = process.env.X_BEARER_TOKEN;
+const BASE_URL = process.env.BASE_URL || 'https://kyros-bot-production.up.railway.app';
+const PORT = process.env.PORT || 3000;
+
 const GATE_HOURS = 24;
 const DB_FILE = 'pending.json';
 const TRACKER_FILE = 'trackers.json';
 const SETTINGS_FILE = 'settings.json';
+const POINTS_FILE = 'points.json';
+const CAMPAIGNS_FILE = 'campaigns.json';
+const OAUTH_FILE = 'oauth.json';
 const COOLDOWN_SECONDS = 10;
 const cooldowns = new Map();
 const trackerIntervals = new Map();
+const oauthStates = new Map(); // state -> { discordId, guildId }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── File Helpers ─────────────────────────────────────────────────────────────
 
-function loadPending() {
-  try { return JSON.parse(fs.readFileSync(DB_FILE)); }
-  catch { return {}; }
+function load(file) {
+  try { return JSON.parse(fs.readFileSync(file)); } catch { return {}; }
 }
-function savePending(data) { fs.writeFileSync(DB_FILE, JSON.stringify(data)); }
+function save(file, data) { fs.writeFileSync(file, JSON.stringify(data, null, 2)); }
 
-function loadTrackers() {
-  try { return JSON.parse(fs.readFileSync(TRACKER_FILE)); }
-  catch { return {}; }
-}
-function saveTrackers(data) { fs.writeFileSync(TRACKER_FILE, JSON.stringify(data)); }
-
-function loadSettings() {
-  try { return JSON.parse(fs.readFileSync(SETTINGS_FILE)); }
-  catch { return {}; }
-}
-function saveSettings(data) { fs.writeFileSync(SETTINGS_FILE, JSON.stringify(data)); }
+function loadPending() { return load(DB_FILE); }
+function savePending(d) { save(DB_FILE, d); }
+function loadTrackers() { return load(TRACKER_FILE); }
+function saveTrackers(d) { save(TRACKER_FILE, d); }
+function loadSettings() { return load(SETTINGS_FILE); }
+function saveSettings(d) { save(SETTINGS_FILE, d); }
+function loadPoints() { return load(POINTS_FILE); }
+function savePoints(d) { save(POINTS_FILE, d); }
+function loadCampaigns() { return load(CAMPAIGNS_FILE); }
+function saveCampaigns(d) { save(CAMPAIGNS_FILE, d); }
+function loadOAuth() { return load(OAUTH_FILE); }
+function saveOAuth(d) { save(OAUTH_FILE, d); }
 
 function getDefaultChannel(guildId) {
-  const settings = loadSettings();
-  return settings[guildId]?.defaultChannel || null;
+  return loadSettings()[guildId]?.defaultChannel || null;
 }
 
-// ─── OpenSea ─────────────────────────────────────────────────────────────────
+// ─── Points Helpers ───────────────────────────────────────────────────────────
+
+function getPoints(guildId, userId) {
+  return loadPoints()[guildId]?.[userId] || 0;
+}
+
+function addPoints(guildId, userId, amount) {
+  const pts = loadPoints();
+  if (!pts[guildId]) pts[guildId] = {};
+  pts[guildId][userId] = (pts[guildId][userId] || 0) + amount;
+  savePoints(pts);
+  return pts[guildId][userId];
+}
+
+function deductPoints(guildId, userId, amount) {
+  const pts = loadPoints();
+  if (!pts[guildId]) pts[guildId] = {};
+  pts[guildId][userId] = Math.max(0, (pts[guildId][userId] || 0) - amount);
+  savePoints(pts);
+  return pts[guildId][userId];
+}
+
+// ─── X OAuth 2.0 ─────────────────────────────────────────────────────────────
+
+function getXAuthUrl(discordId, guildId) {
+  const state = crypto.randomBytes(16).toString('hex');
+  oauthStates.set(state, { discordId, guildId });
+  setTimeout(() => oauthStates.delete(state), 10 * 60 * 1000); // 10 min expiry
+
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: X_CLIENT_ID,
+    redirect_uri: `${BASE_URL}/auth/callback`,
+    scope: 'tweet.read users.read like.read',
+    state,
+    code_challenge: 'challenge',
+    code_challenge_method: 'plain',
+  });
+  return `https://twitter.com/i/oauth2/authorize?${params}`;
+}
+
+async function exchangeCode(code) {
+  const creds = Buffer.from(`${X_CLIENT_ID}:${X_CLIENT_SECRET}`).toString('base64');
+  const res = await fetch('https://api.twitter.com/2/oauth2/token', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Authorization': `Basic ${creds}`,
+    },
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: `${BASE_URL}/auth/callback`,
+      code_verifier: 'challenge',
+    }),
+  });
+  return res.json();
+}
+
+async function getXUser(accessToken) {
+  const res = await fetch('https://api.twitter.com/2/users/me', {
+    headers: { 'Authorization': `Bearer ${accessToken}` },
+  });
+  return res.json();
+}
+
+async function checkLiked(tweetId, xUserId) {
+  const res = await fetch(
+    `https://api.twitter.com/2/users/${xUserId}/liked_tweets?max_results=100`,
+    { headers: { 'Authorization': `Bearer ${X_BEARER_TOKEN}` } }
+  );
+  const data = await res.json();
+  return (data.data || []).some(t => t.id === tweetId);
+}
+
+async function checkRetweeted(tweetId, xUserId) {
+  const res = await fetch(
+    `https://api.twitter.com/2/tweets/${tweetId}/retweeted_by`,
+    { headers: { 'Authorization': `Bearer ${X_BEARER_TOKEN}` } }
+  );
+  const data = await res.json();
+  return (data.data || []).some(u => u.id === xUserId);
+}
+
+async function checkReplied(tweetId, xUsername) {
+  const res = await fetch(
+    `https://api.twitter.com/2/tweets/search/recent?query=conversation_id:${tweetId} from:${xUsername}&max_results=10`,
+    { headers: { 'Authorization': `Bearer ${X_BEARER_TOKEN}` } }
+  );
+  const data = await res.json();
+  return (data.data || []).length > 0;
+}
+
+// ─── HTTP Server for OAuth Callback ──────────────────────────────────────────
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, BASE_URL);
+
+  if (url.pathname === '/auth/callback') {
+    const code = url.searchParams.get('code');
+    const state = url.searchParams.get('state');
+
+    if (!code || !state || !oauthStates.has(state)) {
+      res.writeHead(400);
+      res.end('Invalid or expired link. Please try again in Discord.');
+      return;
+    }
+
+    const { discordId, guildId } = oauthStates.get(state);
+    oauthStates.delete(state);
+
+    try {
+      const tokenData = await exchangeCode(code);
+      if (!tokenData.access_token) throw new Error('No access token');
+
+      const xUser = await getXUser(tokenData.access_token);
+      const xId = xUser.data?.id;
+      const xUsername = xUser.data?.username;
+
+      if (!xId) throw new Error('Could not get X user');
+
+      const oauth = loadOAuth();
+      oauth[discordId] = { xId, xUsername, accessToken: tokenData.access_token };
+      saveOAuth(oauth);
+
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(`
+        <html><body style="background:#1a1a1a;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+          <div style="text-align:center">
+            <h1>✅ Connected!</h1>
+            <p>Your X account <strong>@${xUsername}</strong> is now linked to Kyros Bot.</p>
+            <p>You can close this tab and go back to Discord.</p>
+          </div>
+        </body></html>
+      `);
+
+      // DM the user confirmation
+      try {
+        const user = await client.users.fetch(discordId);
+        await user.send(`✅ Your X account **@${xUsername}** has been linked! You can now participate in engagement campaigns.`);
+      } catch {}
+
+    } catch (e) {
+      console.error('OAuth error:', e);
+      res.writeHead(500);
+      res.end('Something went wrong. Please try again.');
+    }
+    return;
+  }
+
+  res.writeHead(200);
+  res.end('Kyros Bot is running.');
+});
+
+server.listen(PORT, () => console.log(`HTTP server running on port ${PORT}`));
+
+// ─── OpenSea ──────────────────────────────────────────────────────────────────
 
 async function getCollectionStats(contract) {
   const headers = { 'x-api-key': OPENSEA_API_KEY, 'accept': 'application/json' };
-
-  const assetRes = await fetch(
-    `https://api.opensea.io/api/v2/chain/ethereum/contract/${contract}`,
-    { headers }
-  );
+  const assetRes = await fetch(`https://api.opensea.io/api/v2/chain/ethereum/contract/${contract}`, { headers });
   const assetData = await assetRes.json();
   const slug = assetData.collection;
   if (!slug) return null;
 
-  const statsRes = await fetch(
-    `https://api.opensea.io/api/v2/collections/${slug}/stats`,
-    { headers }
-  );
+  const statsRes = await fetch(`https://api.opensea.io/api/v2/collections/${slug}/stats`, { headers });
   const statsData = await statsRes.json();
   const total = statsData.total || {};
   const intervals = statsData.intervals || [];
   const oneHour = intervals.find(i => i.interval === 'one_hour') || {};
 
-  const salesRes = await fetch(
-    `https://api.opensea.io/api/v2/events/collection/${slug}?event_type=sale&limit=50`,
-    { headers }
-  );
+  const salesRes = await fetch(`https://api.opensea.io/api/v2/events/collection/${slug}?event_type=sale&limit=50`, { headers });
   const salesData = await salesRes.json();
   const sales = salesData.asset_events || [];
 
   const now = Date.now();
   const recent5 = sales.filter(s => now - s.closing_date * 1000 < 5 * 60 * 1000);
-
   const prices5 = recent5.map(s => parseFloat(s.payment?.quantity || 0) / 1e18).filter(Boolean);
   const avgPrice = prices5.length ? prices5.reduce((a, b) => a + b, 0) / prices5.length : 0;
   const minPrice = prices5.length ? Math.min(...prices5) : 0;
   const maxPrice = prices5.length ? Math.max(...prices5) : 0;
   const buyers5 = new Set(recent5.map(s => s.buyer)).size;
   const sellers5 = new Set(recent5.map(s => s.seller)).size;
-
   const buyerCount = {};
   recent5.forEach(s => { buyerCount[s.buyer] = (buyerCount[s.buyer] || 0) + 1; });
   const topBuyer = Object.entries(buyerCount).sort((a, b) => b[1] - a[1])[0];
-
   const collRes = await fetch(`https://api.opensea.io/api/v2/collections/${slug}`, { headers });
   const collData = await collRes.json();
 
   return {
-    name: collData.name || slug,
-    slug,
+    name: collData.name || slug, slug,
     floor: (oneHour.floor_price || total.floor_price || 0).toFixed(4),
-    sales5: recent5.length,
-    sales1h: oneHour.sales || 0,
+    sales5: recent5.length, sales1h: oneHour.sales || 0,
     vol5: prices5.reduce((a, b) => a + b, 0).toFixed(4),
     vol1h: (oneHour.volume || 0).toFixed(4),
-    avgPrice: avgPrice.toFixed(4),
-    minPrice: minPrice.toFixed(4),
-    maxPrice: maxPrice.toFixed(4),
-    buyers: buyers5,
-    sellers: sellers5,
-    topBuyer: topBuyer ? topBuyer[0] : null,
-    topBuyerCount: topBuyer ? topBuyer[1] : 0,
+    avgPrice: avgPrice.toFixed(4), minPrice: minPrice.toFixed(4), maxPrice: maxPrice.toFixed(4),
+    buyers: buyers5, sellers: sellers5,
+    topBuyer: topBuyer ? topBuyer[0] : null, topBuyerCount: topBuyer ? topBuyer[1] : 0,
     rate: (recent5.length / 5).toFixed(1),
-    openseaUrl: `https://opensea.io/collection/${slug}`,
-    image: collData.image_url || null,
+    openseaUrl: `https://opensea.io/collection/${slug}`, image: collData.image_url || null,
   };
 }
 
-function buildEmbed(stats) {
-  const shortBuyer = stats.topBuyer
-    ? `${stats.topBuyer.slice(0, 6)}...${stats.topBuyer.slice(-4)} · ${stats.topBuyerCount} buys`
-    : 'N/A';
-
+function buildVolumeEmbed(stats) {
+  const shortBuyer = stats.topBuyer ? `${stats.topBuyer.slice(0, 6)}...${stats.topBuyer.slice(-4)} · ${stats.topBuyerCount} buys` : 'N/A';
   let emoji = '📊';
   if (parseFloat(stats.rate) >= 10) emoji = '🔥';
   else if (parseFloat(stats.rate) >= 5) emoji = '🚀';
   else if (parseFloat(stats.vol5) > 0) emoji = '📈';
-
   return new EmbedBuilder()
     .setColor(0x5865F2)
     .setTitle(`${emoji} ${stats.name} [Ethereum · 5min]`)
@@ -151,10 +294,8 @@ async function startTracker(contract, channelId) {
       const channel = await client.channels.fetch(channelId);
       const stats = await getCollectionStats(contract);
       if (!stats) return;
-      await channel.send({ embeds: [buildEmbed(stats)] });
-    } catch (e) {
-      console.error(`Tracker error for ${contract}:`, e.message);
-    }
+      await channel.send({ embeds: [buildVolumeEmbed(stats)] });
+    } catch (e) { console.error(`Tracker error for ${contract}:`, e.message); }
   }, 5 * 60 * 1000);
   trackerIntervals.set(key, interval);
 }
@@ -178,7 +319,6 @@ async function scheduleKick(userId, remaining) {
       const member = await guild.members.fetch(userId);
       if (member.roles.cache.size <= 1) {
         await member.kick('Did not get a role within 24 hours');
-        console.log(`Kicked: ${member.user.tag}`);
       }
     } catch {}
     const p = loadPending();
@@ -193,30 +333,58 @@ const commands = [
   new SlashCommandBuilder()
     .setName('nuke')
     .setDescription('Kick inactive members')
-    .addIntegerOption(opt =>
-      opt.setName('days').setDescription('Days of inactivity').setRequired(true))
+    .addIntegerOption(opt => opt.setName('days').setDescription('Days of inactivity').setRequired(true))
     .toJSON(),
+
   new SlashCommandBuilder()
     .setName('setchannel')
     .setDescription('Set the default channel for NFT volume updates')
-    .addChannelOption(opt =>
-      opt.setName('channel').setDescription('Channel to post updates in').setRequired(true))
+    .addChannelOption(opt => opt.setName('channel').setDescription('Channel to post updates in').setRequired(true))
     .toJSON(),
+
   new SlashCommandBuilder()
     .setName('track')
     .setDescription('Track volume updates for an NFT collection')
-    .addStringOption(opt =>
-      opt.setName('contract').setDescription('Contract address (0x...)').setRequired(true))
+    .addStringOption(opt => opt.setName('contract').setDescription('Contract address (0x...)').setRequired(true))
     .toJSON(),
+
   new SlashCommandBuilder()
     .setName('untrack')
     .setDescription('Stop tracking a collection')
-    .addStringOption(opt =>
-      opt.setName('contract').setDescription('Contract address to stop tracking').setRequired(true))
+    .addStringOption(opt => opt.setName('contract').setDescription('Contract address').setRequired(true))
     .toJSON(),
+
   new SlashCommandBuilder()
     .setName('trackers')
     .setDescription('List all active trackers in this server')
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('campaign')
+    .setDescription('Create an engagement campaign')
+    .addStringOption(opt => opt.setName('tweet').setDescription('Full tweet URL').setRequired(true))
+    .addStringOption(opt => opt.setName('tasks').setDescription('Tasks: like, retweet, comment (comma separated)').setRequired(true))
+    .addIntegerOption(opt => opt.setName('like_points').setDescription('Points for liking').setRequired(false))
+    .addIntegerOption(opt => opt.setName('retweet_points').setDescription('Points for retweeting').setRequired(false))
+    .addIntegerOption(opt => opt.setName('comment_points').setDescription('Points for commenting').setRequired(false))
+    .addIntegerOption(opt => opt.setName('wl_cost').setDescription('Points needed to claim WL').setRequired(false))
+    .addRoleOption(opt => opt.setName('wl_role').setDescription('Role to give on WL claim').setRequired(false))
+    .addIntegerOption(opt => opt.setName('expires_hours').setDescription('Hours until campaign expires').setRequired(false))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('connectx')
+    .setDescription('Connect your X (Twitter) account to earn points')
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('points')
+    .setDescription('Check your points balance')
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('leaderboard')
+    .setDescription('See the top point earners in this server')
     .toJSON(),
 ];
 
@@ -238,9 +406,7 @@ client.once('clientReady', async () => {
       try {
         const guild = await client.guilds.fetch(GUILD_ID);
         const member = await guild.members.fetch(userId);
-        if (member.roles.cache.size <= 1) {
-          await member.kick('Did not get a role within 24 hours');
-        }
+        if (member.roles.cache.size <= 1) await member.kick('Did not get a role within 24 hours');
       } catch {}
       delete pending[userId];
     } else {
@@ -266,19 +432,97 @@ client.on('guildMemberAdd', (member) => {
 client.on('guildMemberUpdate', (oldMember, newMember) => {
   if (newMember.roles.cache.size > 1) {
     const pending = loadPending();
-    if (pending[newMember.id]) {
-      delete pending[newMember.id];
-      savePending(pending);
-    }
+    if (pending[newMember.id]) { delete pending[newMember.id]; savePending(pending); }
   }
 });
 
-// ─── Interactions ──────────────────────────────────────────────────────────────
+// ─── Button Interactions ──────────────────────────────────────────────────────
 
 client.on('interactionCreate', async (interaction) => {
+
+  // ── Buttons ──
+  if (interaction.isButton()) {
+    const [action, campaignId] = interaction.customId.split(':');
+    const campaigns = loadCampaigns();
+    const campaign = campaigns[campaignId];
+
+    if (!campaign) return interaction.reply({ content: 'This campaign no longer exists.', ephemeral: true });
+    if (campaign.expiresAt && Date.now() > campaign.expiresAt) {
+      return interaction.reply({ content: 'This campaign has expired.', ephemeral: true });
+    }
+
+    const oauth = loadOAuth();
+    const userOAuth = oauth[interaction.user.id];
+
+    if (action === 'claim_wl') {
+      if (!campaign.wlCost || !campaign.wlRoleId) {
+        return interaction.reply({ content: 'No WL reward set for this campaign.', ephemeral: true });
+      }
+      const pts = getPoints(interaction.guild.id, interaction.user.id);
+      if (pts < campaign.wlCost) {
+        return interaction.reply({ content: `You need **${campaign.wlCost}** points to claim WL. You have **${pts}**.`, ephemeral: true });
+      }
+      try {
+        const member = await interaction.guild.members.fetch(interaction.user.id);
+        await member.roles.add(campaign.wlRoleId);
+        deductPoints(interaction.guild.id, interaction.user.id, campaign.wlCost);
+        return interaction.reply({ content: `✅ WL claimed! You've been given the WL role and **${campaign.wlCost}** points have been deducted.`, ephemeral: true });
+      } catch (e) {
+        return interaction.reply({ content: 'Failed to assign role. Make sure the bot has the Manage Roles permission and its role is above the WL role.', ephemeral: true });
+      }
+    }
+
+    if (!userOAuth) {
+      return interaction.reply({
+        content: 'You need to connect your X account first. Use `/connectx`.',
+        ephemeral: true
+      });
+    }
+
+    const taskKey = `${campaignId}:${interaction.user.id}:${action}`;
+    const campaigns2 = loadCampaigns();
+    if (campaigns2[campaignId]?.completed?.[taskKey]) {
+      return interaction.reply({ content: 'You already completed this task.', ephemeral: true });
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+
+    const tweetId = campaign.tweetId;
+    let verified = false;
+    let pointsEarned = 0;
+
+    try {
+      if (action === 'like') {
+        verified = await checkLiked(tweetId, userOAuth.xId);
+        pointsEarned = campaign.likePoints || 0;
+      } else if (action === 'retweet') {
+        verified = await checkRetweeted(tweetId, userOAuth.xId);
+        pointsEarned = campaign.retweetPoints || 0;
+      } else if (action === 'comment') {
+        verified = await checkReplied(tweetId, userOAuth.xUsername);
+        pointsEarned = campaign.commentPoints || 0;
+      }
+    } catch (e) {
+      console.error('X API error:', e);
+      return interaction.editReply('Could not verify with X. Try again in a moment.');
+    }
+
+    if (!verified) {
+      return interaction.editReply(`❌ Could not verify your ${action}. Make sure you actually completed the task on X, then try again.`);
+    }
+
+    const camps = loadCampaigns();
+    if (!camps[campaignId].completed) camps[campaignId].completed = {};
+    camps[campaignId].completed[taskKey] = true;
+    saveCampaigns(camps);
+
+    const newTotal = addPoints(interaction.guild.id, interaction.user.id, pointsEarned);
+    return interaction.editReply(`✅ ${action.charAt(0).toUpperCase() + action.slice(1)} verified! You earned **${pointsEarned} points**. Total: **${newTotal} points**.`);
+  }
+
   if (!interaction.isChatInputCommand()) return;
 
-  // /nuke
+  // ── /nuke ──
   if (interaction.commandName === 'nuke') {
     if (!interaction.member.permissions.has('KickMembers')) {
       return interaction.reply({ content: 'You do not have permission.', ephemeral: true });
@@ -311,27 +555,25 @@ client.on('interactionCreate', async (interaction) => {
     return interaction.editReply(`Done. Kicked ${kicked} inactive members.`);
   }
 
-  // /setchannel
+  // ── /setchannel ──
   if (interaction.commandName === 'setchannel') {
     if (!interaction.member.permissions.has('ManageGuild')) {
       return interaction.reply({ content: 'You need Manage Server permission.', ephemeral: true });
     }
     const channel = interaction.options.getChannel('channel');
     const settings = loadSettings();
-    settings[interaction.guild.id] = { defaultChannel: channel.id };
+    settings[interaction.guild.id] = { ...settings[interaction.guild.id], defaultChannel: channel.id };
     saveSettings(settings);
-    return interaction.reply(`Default NFT update channel set to <#${channel.id}>. Now use \`/track\` to add collections.`);
+    return interaction.reply(`Default NFT update channel set to <#${channel.id}>.`);
   }
 
-  // /track
+  // ── /track ──
   if (interaction.commandName === 'track') {
     if (!interaction.member.permissions.has('ManageGuild')) {
       return interaction.reply({ content: 'You need Manage Server permission.', ephemeral: true });
     }
     const channelId = getDefaultChannel(interaction.guild.id);
-    if (!channelId) {
-      return interaction.reply({ content: 'No default channel set. Run `/setchannel` first.', ephemeral: true });
-    }
+    if (!channelId) return interaction.reply({ content: 'No default channel set. Run `/setchannel` first.', ephemeral: true });
     const contract = interaction.options.getString('contract').toLowerCase();
     await interaction.reply(`Fetching data for \`${contract}\`...`);
     const stats = await getCollectionStats(contract).catch(() => null);
@@ -341,11 +583,11 @@ client.on('interactionCreate', async (interaction) => {
     saveTrackers(trackers);
     startTracker(contract, channelId);
     const channel = await client.channels.fetch(channelId);
-    await channel.send({ embeds: [buildEmbed(stats)] });
+    await channel.send({ embeds: [buildVolumeEmbed(stats)] });
     return interaction.editReply(`Now tracking **${stats.name}** in <#${channelId}> every 5 minutes.`);
   }
 
-  // /untrack
+  // ── /untrack ──
   if (interaction.commandName === 'untrack') {
     if (!interaction.member.permissions.has('ManageGuild')) {
       return interaction.reply({ content: 'You need Manage Server permission.', ephemeral: true });
@@ -354,15 +596,12 @@ client.on('interactionCreate', async (interaction) => {
     const trackers = loadTrackers();
     const keys = Object.keys(trackers).filter(k => k.startsWith(contract));
     if (keys.length === 0) return interaction.reply({ content: 'No active tracker found.', ephemeral: true });
-    keys.forEach(k => {
-      stopTracker(trackers[k].contract, trackers[k].channelId);
-      delete trackers[k];
-    });
+    keys.forEach(k => { stopTracker(trackers[k].contract, trackers[k].channelId); delete trackers[k]; });
     saveTrackers(trackers);
     return interaction.reply(`Stopped tracking \`${contract}\`.`);
   }
 
-  // /trackers
+  // ── /trackers ──
   if (interaction.commandName === 'trackers') {
     const trackers = loadTrackers();
     const guildTrackers = Object.values(trackers).filter(t => t.guildId === interaction.guild.id);
@@ -370,9 +609,136 @@ client.on('interactionCreate', async (interaction) => {
     const list = guildTrackers.map(t => `\`${t.contract}\` → <#${t.channelId}>`).join('\n');
     return interaction.reply(`**Active Trackers:**\n${list}`);
   }
+
+  // ── /connectX ──
+  if (interaction.commandName === 'connectX') {
+    const oauth = loadOAuth();
+    if (oauth[interaction.user.id]) {
+      return interaction.reply({ content: `Your X account **@${oauth[interaction.user.id].xUsername}** is already connected.`, ephemeral: true });
+    }
+    const url = getXAuthUrl(interaction.user.id, interaction.guild.id);
+    return interaction.reply({
+      content: `Click the button below to connect your X account:`,
+      components: [
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setLabel('Connect X Account').setStyle(ButtonStyle.Link).setURL(url).setEmoji('🐦')
+        )
+      ],
+      ephemeral: true
+    });
+  }
+
+  // ── /points ──
+  if (interaction.commandName === 'points') {
+    const pts = getPoints(interaction.guild.id, interaction.user.id);
+    return interaction.reply({ content: `You have **${pts} points** in this server.`, ephemeral: true });
+  }
+
+  // ── /leaderboard ──
+  if (interaction.commandName === 'leaderboard') {
+    const allPts = loadPoints()[interaction.guild.id] || {};
+    const sorted = Object.entries(allPts).sort((a, b) => b[1] - a[1]).slice(0, 10);
+    if (sorted.length === 0) return interaction.reply({ content: 'No points earned yet.', ephemeral: true });
+    const lines = await Promise.all(sorted.map(async ([uid, pts], i) => {
+      try {
+        const user = await client.users.fetch(uid);
+        return `${i + 1}. **${user.username}** — ${pts} pts`;
+      } catch { return `${i + 1}. Unknown — ${pts} pts`; }
+    }));
+    const embed = new EmbedBuilder()
+      .setColor(0xFFD700)
+      .setTitle('🏆 Points Leaderboard')
+      .setDescription(lines.join('\n'))
+      .setFooter({ text: interaction.guild.name });
+    return interaction.reply({ embeds: [embed] });
+  }
+
+  // ── /campaign ──
+  if (interaction.commandName === 'campaign') {
+    if (!interaction.member.permissions.has('ManageGuild')) {
+      return interaction.reply({ content: 'You need Manage Server permission.', ephemeral: true });
+    }
+
+    const tweetUrl = interaction.options.getString('tweet');
+    const tasksRaw = interaction.options.getString('tasks');
+    const likePoints = interaction.options.getInteger('like_points') || 10;
+    const retweetPoints = interaction.options.getInteger('retweet_points') || 20;
+    const commentPoints = interaction.options.getInteger('comment_points') || 30;
+    const wlCost = interaction.options.getInteger('wl_cost') || null;
+    const wlRole = interaction.options.getRole('wl_role') || null;
+    const expiresHours = interaction.options.getInteger('expires_hours') || null;
+
+    // Extract tweet ID from URL
+    const tweetIdMatch = tweetUrl.match(/status\/(\d+)/);
+    if (!tweetIdMatch) return interaction.reply({ content: 'Invalid tweet URL.', ephemeral: true });
+    const tweetId = tweetIdMatch[1];
+
+    const tasks = tasksRaw.toLowerCase().split(',').map(t => t.trim()).filter(t => ['like', 'retweet', 'comment'].includes(t));
+    if (tasks.length === 0) return interaction.reply({ content: 'Invalid tasks. Use: like, retweet, comment', ephemeral: true });
+
+    const campaignId = crypto.randomBytes(8).toString('hex');
+    const expiresAt = expiresHours ? Date.now() + expiresHours * 60 * 60 * 1000 : null;
+
+    const campaign = {
+      id: campaignId,
+      guildId: interaction.guild.id,
+      tweetId,
+      tweetUrl,
+      tasks,
+      likePoints,
+      retweetPoints,
+      commentPoints,
+      wlCost,
+      wlRoleId: wlRole?.id || null,
+      expiresAt,
+      completed: {},
+    };
+
+    const campaigns = loadCampaigns();
+    campaigns[campaignId] = campaign;
+    saveCampaigns(campaigns);
+
+    // Build embed
+    const taskLines = tasks.map(t => {
+      const pts = t === 'like' ? likePoints : t === 'retweet' ? retweetPoints : commentPoints;
+      return `${t === 'like' ? '❤️' : t === 'retweet' ? '🔁' : '💬'} **${t.charAt(0).toUpperCase() + t.slice(1)}** — ${pts} pts`;
+    });
+
+    const embed = new EmbedBuilder()
+      .setColor(0x1DA1F2)
+      .setTitle('🐦 Engage to collect your points')
+      .setURL(tweetUrl)
+      .setDescription(`[View Tweet](${tweetUrl})\n\n${taskLines.join('\n')}`)
+      .addFields(
+        wlCost ? { name: '🎟️ WL Cost', value: `${wlCost} points`, inline: true } : [],
+        wlRole ? { name: '🎭 WL Role', value: `<@&${wlRole.id}>`, inline: true } : [],
+        expiresAt ? { name: '⏰ Expires', value: `<t:${Math.floor(expiresAt / 1000)}:R>`, inline: true } : [],
+      ).filter(f => f)
+      .setFooter({ text: 'Use /connectx to link your X account first' });
+
+    // Build buttons
+    const buttons = tasks.map(t =>
+      new ButtonBuilder()
+        .setCustomId(`${t}:${campaignId}`)
+        .setLabel(t === 'like' ? '❤️ Like' : t === 'retweet' ? '🔁 Retweet' : '💬 Comment')
+        .setStyle(ButtonStyle.Primary)
+    );
+
+    if (wlCost) {
+      buttons.push(
+        new ButtonBuilder()
+          .setCustomId(`claim_wl:${campaignId}`)
+          .setLabel('🎟️ Claim WL')
+          .setStyle(ButtonStyle.Success)
+      );
+    }
+
+    const row = new ActionRowBuilder().addComponents(buttons);
+    await interaction.reply({ embeds: [embed], components: [row] });
+  }
 });
 
-// ─── AI Chat ───────────────────────────────────────────────────────────────────
+// ─── AI Chat ──────────────────────────────────────────────────────────────────
 
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
