@@ -425,7 +425,19 @@ const commands = [
     .setName('campaign')
     .setDescription('Create an engagement campaign')
     .addStringOption(opt => opt.setName('tweet').setDescription('Full tweet URL').setRequired(true))
-    .addStringOption(opt => opt.setName('tasks').setDescription('Tasks: like, retweet, comment (comma separated)').setRequired(true))
+    .addStringOption(opt =>
+      opt.setName('tasks')
+        .setDescription('Which tasks to require')
+        .setRequired(true)
+        .addChoices(
+          { name: 'Like only', value: 'like' },
+          { name: 'Retweet only', value: 'retweet' },
+          { name: 'Comment only', value: 'comment' },
+          { name: 'Like + Retweet', value: 'like,retweet' },
+          { name: 'Like + Comment', value: 'like,comment' },
+          { name: 'Retweet + Comment', value: 'retweet,comment' },
+          { name: 'Like + Retweet + Comment', value: 'like,retweet,comment' },
+        ))
     .addIntegerOption(opt => opt.setName('like_points').setDescription('Points for liking').setRequired(false))
     .addIntegerOption(opt => opt.setName('retweet_points').setDescription('Points for retweeting').setRequired(false))
     .addIntegerOption(opt => opt.setName('comment_points').setDescription('Points for commenting').setRequired(false))
