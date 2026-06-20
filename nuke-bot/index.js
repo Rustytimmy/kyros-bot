@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, StringSelectMenuBuilder } = require('discord.js');
 const fs = require('fs');
 const http = require('http');
 const crypto = require('crypto');
@@ -29,6 +29,7 @@ const SETTINGS_FILE = 'settings.json';
 const POINTS_FILE = 'points.json';
 const CAMPAIGNS_FILE = 'campaigns.json';
 const OAUTH_FILE = 'oauth.json';
+const MARKET_FILE = 'market.json';
 const COOLDOWN_SECONDS = 10;
 const cooldowns = new Map();
 const trackerIntervals = new Map();
@@ -53,6 +54,8 @@ function loadCampaigns() { return load(CAMPAIGNS_FILE); }
 function saveCampaigns(d) { save(CAMPAIGNS_FILE, d); }
 function loadOAuth() { return load(OAUTH_FILE); }
 function saveOAuth(d) { save(OAUTH_FILE, d); }
+function loadMarket() { return load(MARKET_FILE); }
+function saveMarket(d) { save(MARKET_FILE, d); }
 
 function getDefaultChannel(guildId) {
   return loadSettings()[guildId]?.defaultChannel || null;
@@ -310,6 +313,65 @@ function stopTracker(contract, channelId) {
   return false;
 }
 
+// ─── Marketplace ──────────────────────────────────────────────────────────────
+
+function buildMarketEmbed(guildId) {
+  const market = loadMarket()[guildId] || { items: {} };
+  const items = Object.entries(market.items || {});
+
+  const embed = new EmbedBuilder()
+    .setColor(0x2ECC71)
+    .setTitle('🛒 Marketplace')
+    .setFooter({ text: 'Click Buy Item below to redeem your points' });
+
+  if (items.length === 0) {
+    embed.setDescription('No items available right now. Check back later.');
+    return embed;
+  }
+
+  const lines = items.map(([id, item]) => {
+    const spotsLeft = item.spots === -1 ? 'Unlimited Spots' : `${item.spots - (item.claimedBy?.length || 0)} Spots Left`;
+    return `🎟️ **${item.name}** | **${item.cost}** Points • ${spotsLeft}`;
+  });
+
+  embed.setDescription(lines.join('\n'));
+  return embed;
+}
+
+async function postOrUpdateMarket(guildId) {
+  const settings = loadSettings();
+  const channelId = settings[guildId]?.marketChannel;
+  if (!channelId) return;
+
+  try {
+    const channel = await client.channels.fetch(channelId);
+    const embed = buildMarketEmbed(guildId);
+    const button = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('buy_item_open').setLabel('🛍️ Buy Item').setStyle(ButtonStyle.Success)
+    );
+
+    const market = loadMarket();
+    const messageId = market[guildId]?.messageId;
+
+    if (messageId) {
+      try {
+        const msg = await channel.messages.fetch(messageId);
+        await msg.edit({ embeds: [embed], components: [button] });
+        return;
+      } catch {
+        // message was deleted, fall through to post new one
+      }
+    }
+
+    const sent = await channel.send({ embeds: [embed], components: [button] });
+    if (!market[guildId]) market[guildId] = { items: {} };
+    market[guildId].messageId = sent.id;
+    saveMarket(market);
+  } catch (e) {
+    console.error('Failed to update market:', e.message);
+  }
+}
+
 // ─── Gate ─────────────────────────────────────────────────────────────────────
 
 async function scheduleKick(userId, remaining) {
@@ -386,6 +448,32 @@ const commands = [
     .setName('leaderboard')
     .setDescription('See the top point earners in this server')
     .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('setmarket')
+    .setDescription('Set the channel where the points marketplace is posted')
+    .addChannelOption(opt => opt.setName('channel').setDescription('Channel for the marketplace').setRequired(true))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('additem')
+    .setDescription('Add an item to the points marketplace')
+    .addStringOption(opt => opt.setName('name').setDescription('Item name').setRequired(true))
+    .addIntegerOption(opt => opt.setName('cost').setDescription('Cost in points').setRequired(true))
+    .addRoleOption(opt => opt.setName('role').setDescription('Role to give on purchase').setRequired(true))
+    .addIntegerOption(opt => opt.setName('spots').setDescription('Number of spots available').setRequired(true))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('removeitem')
+    .setDescription('Remove an item from the points marketplace')
+    .addStringOption(opt => opt.setName('name').setDescription('Item name').setRequired(true).setAutocomplete(true))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('resetmarket')
+    .setDescription('Reset all items in the marketplace (restores spots)')
+    .toJSON(),
 ];
 
 const rest = new REST({ version: '10' }).setToken(TOKEN);
@@ -436,11 +524,86 @@ client.on('guildMemberUpdate', (oldMember, newMember) => {
   }
 });
 
-// ─── Button Interactions ──────────────────────────────────────────────────────
+// ─── Button / Select Menu / Autocomplete Interactions ─────────────────────────
 
 client.on('interactionCreate', async (interaction) => {
 
-  // ── Buttons ──
+  // ── Autocomplete ──
+  if (interaction.isAutocomplete()) {
+    if (interaction.commandName === 'removeitem') {
+      const market = loadMarket();
+      const items = Object.values(market[interaction.guild.id]?.items || {});
+      const focused = interaction.options.getFocused().toLowerCase();
+      const matches = items
+        .filter(i => i.name.toLowerCase().includes(focused))
+        .slice(0, 25)
+        .map(i => ({ name: i.name, value: i.name }));
+      return interaction.respond(matches);
+    }
+    return;
+  }
+
+  // ── Marketplace: Open item picker ──
+  if (interaction.isButton() && interaction.customId === 'buy_item_open') {
+    const market = loadMarket();
+    const items = Object.entries(market[interaction.guild.id]?.items || {});
+    const available = items.filter(([id, item]) => item.spots === -1 || (item.spots - (item.claimedBy?.length || 0)) > 0);
+
+    if (available.length === 0) {
+      return interaction.reply({ content: 'No items available right now.', ephemeral: true });
+    }
+
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId('buy_item_select')
+      .setPlaceholder('Choose an item to buy')
+      .addOptions(available.map(([id, item]) => ({
+        label: `${item.name} — ${item.cost} pts`,
+        description: item.spots === -1 ? 'Unlimited spots' : `${item.spots - (item.claimedBy?.length || 0)} spots left`,
+        value: id,
+      })));
+
+    const row = new ActionRowBuilder().addComponents(menu);
+    return interaction.reply({ content: 'Select an item to redeem:', components: [row], ephemeral: true });
+  }
+
+  // ── Marketplace: Item selected ──
+  if (interaction.isStringSelectMenu() && interaction.customId === 'buy_item_select') {
+    const itemId = interaction.values[0];
+    const market = loadMarket();
+    const guildMarket = market[interaction.guild.id];
+    const item = guildMarket?.items?.[itemId];
+
+    if (!item) return interaction.update({ content: 'This item no longer exists.', components: [] });
+
+    const spotsLeft = item.spots === -1 ? Infinity : item.spots - (item.claimedBy?.length || 0);
+    if (spotsLeft <= 0) return interaction.update({ content: 'This item is sold out.', components: [] });
+
+    if ((item.claimedBy || []).includes(interaction.user.id)) {
+      return interaction.update({ content: 'You already redeemed this item.', components: [] });
+    }
+
+    const pts = getPoints(interaction.guild.id, interaction.user.id);
+    if (pts < item.cost) {
+      return interaction.update({ content: `You need **${item.cost}** points. You have **${pts}**.`, components: [] });
+    }
+
+    try {
+      const member = await interaction.guild.members.fetch(interaction.user.id);
+      await member.roles.add(item.roleId);
+      deductPoints(interaction.guild.id, interaction.user.id, item.cost);
+
+      if (!item.claimedBy) item.claimedBy = [];
+      item.claimedBy.push(interaction.user.id);
+      saveMarket(market);
+      await postOrUpdateMarket(interaction.guild.id);
+
+      return interaction.update({ content: `✅ Redeemed **${item.name}**! You've been given <@&${item.roleId}> and **${item.cost}** points were deducted.`, components: [] });
+    } catch (e) {
+      return interaction.update({ content: 'Failed to assign role. Make sure the bot has Manage Roles permission and its role is above the item role.', components: [] });
+    }
+  }
+
+  // ── Campaign Buttons ──
   if (interaction.isButton()) {
     const [action, campaignId] = interaction.customId.split(':');
     const campaigns = loadCampaigns();
@@ -610,8 +773,8 @@ client.on('interactionCreate', async (interaction) => {
     return interaction.reply(`**Active Trackers:**\n${list}`);
   }
 
-  // ── /connectX ──
-  if (interaction.commandName === 'connectX') {
+  // ── /connectx ──
+  if (interaction.commandName === 'connectx') {
     const oauth = loadOAuth();
     if (oauth[interaction.user.id]) {
       return interaction.reply({ content: `Your X account **@${oauth[interaction.user.id].xUsername}** is already connected.`, ephemeral: true });
@@ -651,6 +814,76 @@ client.on('interactionCreate', async (interaction) => {
       .setDescription(lines.join('\n'))
       .setFooter({ text: interaction.guild.name });
     return interaction.reply({ embeds: [embed] });
+  }
+
+  // ── /setmarket ──
+  if (interaction.commandName === 'setmarket') {
+    if (!interaction.member.permissions.has('ManageGuild')) {
+      return interaction.reply({ content: 'You need Manage Server permission.', ephemeral: true });
+    }
+    const channel = interaction.options.getChannel('channel');
+    const settings = loadSettings();
+    settings[interaction.guild.id] = { ...settings[interaction.guild.id], marketChannel: channel.id };
+    saveSettings(settings);
+    await interaction.reply(`Marketplace channel set to <#${channel.id}>. Posting shop now...`);
+    await postOrUpdateMarket(interaction.guild.id);
+    return;
+  }
+
+  // ── /additem ──
+  if (interaction.commandName === 'additem') {
+    if (!interaction.member.permissions.has('ManageGuild')) {
+      return interaction.reply({ content: 'You need Manage Server permission.', ephemeral: true });
+    }
+    const settings = loadSettings();
+    if (!settings[interaction.guild.id]?.marketChannel) {
+      return interaction.reply({ content: 'Set a marketplace channel first with `/setmarket`.', ephemeral: true });
+    }
+    const name = interaction.options.getString('name');
+    const cost = interaction.options.getInteger('cost');
+    const role = interaction.options.getRole('role');
+    const spots = interaction.options.getInteger('spots');
+
+    const market = loadMarket();
+    if (!market[interaction.guild.id]) market[interaction.guild.id] = { items: {} };
+    const itemId = crypto.randomBytes(6).toString('hex');
+    market[interaction.guild.id].items[itemId] = {
+      name, cost, roleId: role.id,
+      spots: spots <= 0 ? -1 : spots,
+      claimedBy: [],
+    };
+    saveMarket(market);
+    await postOrUpdateMarket(interaction.guild.id);
+    return interaction.reply({ content: `Added **${name}** to the marketplace — ${cost} points, ${spots <= 0 ? 'unlimited' : spots} spots.`, ephemeral: true });
+  }
+
+  // ── /removeitem ──
+  if (interaction.commandName === 'removeitem') {
+    if (!interaction.member.permissions.has('ManageGuild')) {
+      return interaction.reply({ content: 'You need Manage Server permission.', ephemeral: true });
+    }
+    const name = interaction.options.getString('name');
+    const market = loadMarket();
+    const items = market[interaction.guild.id]?.items || {};
+    const matchId = Object.keys(items).find(id => items[id].name.toLowerCase() === name.toLowerCase());
+    if (!matchId) return interaction.reply({ content: 'Item not found.', ephemeral: true });
+    delete items[matchId];
+    saveMarket(market);
+    await postOrUpdateMarket(interaction.guild.id);
+    return interaction.reply({ content: `Removed **${name}** from the marketplace.`, ephemeral: true });
+  }
+
+  // ── /resetmarket ──
+  if (interaction.commandName === 'resetmarket') {
+    if (!interaction.member.permissions.has('ManageGuild')) {
+      return interaction.reply({ content: 'You need Manage Server permission.', ephemeral: true });
+    }
+    const market = loadMarket();
+    const items = market[interaction.guild.id]?.items || {};
+    Object.values(items).forEach(item => { item.claimedBy = []; });
+    saveMarket(market);
+    await postOrUpdateMarket(interaction.guild.id);
+    return interaction.reply({ content: 'All item spots have been reset.', ephemeral: true });
   }
 
   // ── /campaign ──
@@ -704,16 +937,17 @@ client.on('interactionCreate', async (interaction) => {
       return `${t === 'like' ? '❤️' : t === 'retweet' ? '🔁' : '💬'} **${t.charAt(0).toUpperCase() + t.slice(1)}** — ${pts} pts`;
     });
 
+    const extraFields = [];
+    if (wlCost) extraFields.push({ name: '🎟️ WL Cost', value: `${wlCost} points`, inline: true });
+    if (wlRole) extraFields.push({ name: '🎭 WL Role', value: `<@&${wlRole.id}>`, inline: true });
+    if (expiresAt) extraFields.push({ name: '⏰ Expires', value: `<t:${Math.floor(expiresAt / 1000)}:R>`, inline: true });
+
     const embed = new EmbedBuilder()
       .setColor(0x1DA1F2)
       .setTitle('🐦 Engage to collect your points')
       .setURL(tweetUrl)
       .setDescription(`[View Tweet](${tweetUrl})\n\n${taskLines.join('\n')}`)
-      .addFields(
-        wlCost ? { name: '🎟️ WL Cost', value: `${wlCost} points`, inline: true } : [],
-        wlRole ? { name: '🎭 WL Role', value: `<@&${wlRole.id}>`, inline: true } : [],
-        expiresAt ? { name: '⏰ Expires', value: `<t:${Math.floor(expiresAt / 1000)}:R>`, inline: true } : [],
-      ).filter(f => f)
+      .addFields(extraFields)
       .setFooter({ text: 'Use /connectx to link your X account first' });
 
     // Build buttons
