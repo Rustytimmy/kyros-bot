@@ -891,7 +891,7 @@ client.on('interactionCreate', async (interaction) => {
     if (announceChannelId) {
       try {
         const announceChannel = await client.channels.fetch(announceChannelId);
-        const alertEmoji = '<a:alert_1:1103044214805250108>';
+        const alertEmoji = '<a:RedAlert:1518151378428625076>';
         const announceEmbed = new EmbedBuilder()
           .setColor(0x2ECC71)
           .setTitle('New Listing!!!')
