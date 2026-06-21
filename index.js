@@ -492,6 +492,33 @@ const commands = [
     .setName('resetmarket')
     .setDescription('Reset all items in the marketplace (restores spots)')
     .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('addpoints')
+    .setDescription('Manually add points to a user')
+    .addUserOption(opt => opt.setName('user').setDescription('User to give points to').setRequired(true))
+    .addIntegerOption(opt => opt.setName('amount').setDescription('Points to add').setRequired(true))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('importpoints')
+    .setDescription('Bulk import points from a CSV file (username,points)')
+    .addAttachmentOption(opt => opt.setName('file').setDescription('CSV file with username,points per line').setRequired(true))
+    .addStringOption(opt =>
+      opt.setName('mode')
+        .setDescription('How to handle existing points')
+        .setRequired(true)
+        .addChoices(
+          { name: 'Add to existing points', value: 'add' },
+          { name: 'Overwrite existing points', value: 'overwrite' },
+          { name: 'Skip if user already has points', value: 'skip' },
+        ))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('exportpoints')
+    .setDescription('Export all points in this server as a CSV file')
+    .toJSON(),
 ];
 
 const rest = new REST({ version: '10' }).setToken(TOKEN);
@@ -932,6 +959,127 @@ client.on('interactionCreate', async (interaction) => {
     saveMarket(market);
     await postOrUpdateMarket(interaction.guild.id);
     return interaction.reply({ content: 'All item spots have been reset.', ephemeral: true });
+  }
+
+  // ── /addpoints ──
+  if (interaction.commandName === 'addpoints') {
+    if (!interaction.member.permissions.has('ManageGuild')) {
+      return interaction.reply({ content: 'You need Manage Server permission.', ephemeral: true });
+    }
+    const user = interaction.options.getUser('user');
+    const amount = interaction.options.getInteger('amount');
+    const newTotal = addPoints(interaction.guild.id, user.id, amount);
+    return interaction.reply(`Added **${amount}** points to **${user.username}**. New total: **${newTotal}**.`);
+  }
+
+  // ── /importpoints ──
+  if (interaction.commandName === 'importpoints') {
+    if (!interaction.member.permissions.has('ManageGuild')) {
+      return interaction.reply({ content: 'You need Manage Server permission.', ephemeral: true });
+    }
+    const file = interaction.options.getAttachment('file');
+    const mode = interaction.options.getString('mode');
+
+    if (!file.name.endsWith('.csv') && !file.name.endsWith('.txt')) {
+      return interaction.reply({ content: 'Please upload a .csv or .txt file.', ephemeral: true });
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+
+    try {
+      const res = await fetch(file.url);
+      const text = await res.text();
+      const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+
+      // Fetch all members once to match usernames
+      const members = await interaction.guild.members.fetch();
+      const byUsername = new Map();
+      const byDisplayName = new Map();
+      members.forEach(m => {
+        byUsername.set(m.user.username.toLowerCase(), m.id);
+        byDisplayName.set(m.displayName.toLowerCase(), m.id);
+      });
+
+      let imported = 0;
+      let skipped = 0;
+      const notFound = [];
+
+      for (const line of lines) {
+        const parts = line.split(',').map(p => p.trim());
+        if (parts.length < 2) continue;
+        const rawName = parts[0].replace(/^["']|["']$/g, '');
+        const pointsVal = parseInt(parts[1].replace(/[^0-9-]/g, ''), 10);
+        if (!rawName || isNaN(pointsVal)) continue;
+
+        const lookupName = rawName.toLowerCase();
+        const userId = byUsername.get(lookupName) || byDisplayName.get(lookupName);
+
+        if (!userId) {
+          notFound.push(rawName);
+          continue;
+        }
+
+        const existing = getPoints(interaction.guild.id, userId);
+
+        if (mode === 'skip' && existing > 0) {
+          skipped++;
+          continue;
+        }
+
+        if (mode === 'overwrite') {
+          const pts = loadPoints();
+          if (!pts[interaction.guild.id]) pts[interaction.guild.id] = {};
+          pts[interaction.guild.id][userId] = pointsVal;
+          savePoints(pts);
+        } else {
+          addPoints(interaction.guild.id, userId, pointsVal);
+        }
+        imported++;
+      }
+
+      let summary = `✅ Imported points for **${imported}** users.`;
+      if (skipped > 0) summary += `\n⏭️ Skipped **${skipped}** users who already had points.`;
+      if (notFound.length > 0) {
+        summary += `\n⚠️ Could not match **${notFound.length}** username(s) to a server member: ${notFound.slice(0, 15).join(', ')}${notFound.length > 15 ? '...' : ''}`;
+      }
+
+      return interaction.editReply(summary);
+    } catch (e) {
+      console.error('Import error:', e);
+      return interaction.editReply('Failed to read the file. Make sure it\'s a valid CSV with `username,points` per line.');
+    }
+  }
+
+  // ── /exportpoints ──
+  if (interaction.commandName === 'exportpoints') {
+    if (!interaction.member.permissions.has('ManageGuild')) {
+      return interaction.reply({ content: 'You need Manage Server permission.', ephemeral: true });
+    }
+    await interaction.deferReply({ ephemeral: true });
+
+    const allPts = loadPoints()[interaction.guild.id] || {};
+    const entries = Object.entries(allPts);
+    if (entries.length === 0) {
+      return interaction.editReply('No points data to export yet.');
+    }
+
+    const rows = ['username,points'];
+    for (const [userId, pts] of entries) {
+      try {
+        const user = await client.users.fetch(userId);
+        rows.push(`${user.username},${pts}`);
+      } catch {
+        rows.push(`${userId},${pts}`);
+      }
+    }
+
+    const csvContent = rows.join('\n');
+    const buffer = Buffer.from(csvContent, 'utf-8');
+
+    return interaction.editReply({
+      content: `Exported **${entries.length}** users' points.`,
+      files: [{ attachment: buffer, name: `kyros-points-${interaction.guild.id}.csv` }]
+    });
   }
 
   // ── /campaign ──
