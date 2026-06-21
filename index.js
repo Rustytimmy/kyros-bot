@@ -117,7 +117,11 @@ async function exchangeCode(code) {
       code_verifier: 'challenge',
     }),
   });
-  return res.json();
+  const data = await res.json();
+  if (!res.ok) {
+    console.error('Token exchange failed:', res.status, JSON.stringify(data));
+  }
+  return data;
 }
 
 async function getXUser(accessToken) {
