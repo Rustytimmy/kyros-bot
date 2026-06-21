@@ -2,6 +2,7 @@ const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuild
 const fs = require('fs');
 const http = require('http');
 const crypto = require('crypto');
+const { Pool } = require('pg');
 
 const client = new Client({
   intents: [
@@ -21,26 +22,65 @@ const X_CLIENT_SECRET = process.env.X_CLIENT_SECRET;
 const X_BEARER_TOKEN = process.env.X_BEARER_TOKEN;
 const BASE_URL = process.env.BASE_URL || 'https://kyros-bot-production.up.railway.app';
 const PORT = process.env.PORT || 3000;
+const DATABASE_URL = process.env.DATABASE_URL;
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: DATABASE_URL && DATABASE_URL.includes('railway') ? { rejectUnauthorized: false } : false,
+});
 
 const GATE_HOURS = 24;
-const DB_FILE = 'pending.json';
-const TRACKER_FILE = 'trackers.json';
-const SETTINGS_FILE = 'settings.json';
-const POINTS_FILE = 'points.json';
-const CAMPAIGNS_FILE = 'campaigns.json';
-const OAUTH_FILE = 'oauth.json';
-const MARKET_FILE = 'market.json';
+const DB_FILE = 'pending';
+const TRACKER_FILE = 'trackers';
+const SETTINGS_FILE = 'settings';
+const POINTS_FILE = 'points';
+const CAMPAIGNS_FILE = 'campaigns';
+const OAUTH_FILE = 'oauth';
+const MARKET_FILE = 'market';
 const COOLDOWN_SECONDS = 10;
 const cooldowns = new Map();
 const trackerIntervals = new Map();
 const oauthStates = new Map(); // state -> { discordId, guildId }
 
-// ─── File Helpers ─────────────────────────────────────────────────────────────
+// In-memory cache so sync-style code keeps working without rewriting every call site.
+// Loaded from Postgres on startup, written through to Postgres on every save.
+const cache = {};
+
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS kv_store (
+      key TEXT PRIMARY KEY,
+      value JSONB NOT NULL
+    )
+  `);
+  const res = await pool.query('SELECT key, value FROM kv_store');
+  for (const row of res.rows) {
+    cache[row.key] = row.value;
+  }
+  console.log(`Loaded ${res.rows.length} keys from Postgres.`);
+}
+
+async function persist(key, data) {
+  cache[key] = data;
+  try {
+    await pool.query(
+      `INSERT INTO kv_store (key, value) VALUES ($1, $2)
+       ON CONFLICT (key) DO UPDATE SET value = $2`,
+      [key, JSON.stringify(data)]
+    );
+  } catch (e) {
+    console.error(`Failed to persist key "${key}":`, e.message);
+  }
+}
+
+// ─── File Helpers (now backed by Postgres via in-memory cache) ────────────────
 
 function load(file) {
-  try { return JSON.parse(fs.readFileSync(file)); } catch { return {}; }
+  return cache[file] || {};
 }
-function save(file, data) { fs.writeFileSync(file, JSON.stringify(data, null, 2)); }
+function save(file, data) {
+  persist(file, data); // fire and forget; cache updates synchronously inside persist()
+}
 
 function loadPending() { return load(DB_FILE); }
 function savePending(d) { save(DB_FILE, d); }
@@ -1210,4 +1250,9 @@ client.on('messageCreate', async (message) => {
   }
 });
 
-client.login(TOKEN).catch(console.error);
+initDb()
+  .then(() => client.login(TOKEN))
+  .catch(e => {
+    console.error('Failed to initialize database:', e);
+    process.exit(1);
+  });
