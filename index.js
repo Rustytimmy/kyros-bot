@@ -468,6 +468,12 @@ const commands = [
     .toJSON(),
 
   new SlashCommandBuilder()
+    .setName('setannounce')
+    .setDescription('Set the channel where new listing announcements are posted')
+    .addChannelOption(opt => opt.setName('channel').setDescription('Channel for announcements').setRequired(true))
+    .toJSON(),
+
+  new SlashCommandBuilder()
     .setName('additem')
     .setDescription('Add an item to the points marketplace')
     .addStringOption(opt => opt.setName('name').setDescription('Item name').setRequired(true))
@@ -842,13 +848,26 @@ client.on('interactionCreate', async (interaction) => {
     return;
   }
 
+  // ── /setannounce ──
+  if (interaction.commandName === 'setannounce') {
+    if (!interaction.member.permissions.has('ManageGuild')) {
+      return interaction.reply({ content: 'You need Manage Server permission.', ephemeral: true });
+    }
+    const channel = interaction.options.getChannel('channel');
+    const settings = loadSettings();
+    settings[interaction.guild.id] = { ...settings[interaction.guild.id], announceChannel: channel.id };
+    saveSettings(settings);
+    return interaction.reply(`New listing announcements will now be posted in <#${channel.id}>.`);
+  }
+
   // ── /additem ──
   if (interaction.commandName === 'additem') {
     if (!interaction.member.permissions.has('ManageGuild')) {
       return interaction.reply({ content: 'You need Manage Server permission.', ephemeral: true });
     }
     const settings = loadSettings();
-    if (!settings[interaction.guild.id]?.marketChannel) {
+    const marketChannelId = settings[interaction.guild.id]?.marketChannel;
+    if (!marketChannelId) {
       return interaction.reply({ content: 'Set a marketplace channel first with `/setmarket`.', ephemeral: true });
     }
     const name = interaction.options.getString('name');
@@ -866,6 +885,23 @@ client.on('interactionCreate', async (interaction) => {
     };
     saveMarket(market);
     await postOrUpdateMarket(interaction.guild.id);
+
+    // Announce the new listing automatically in the announcement channel, tagging @everyone
+    const announceChannelId = settings[interaction.guild.id]?.announceChannel;
+    if (announceChannelId) {
+      try {
+        const announceChannel = await client.channels.fetch(announceChannelId);
+        const alertEmoji = '<a:alert_1:1103044214805250108>';
+        const announceEmbed = new EmbedBuilder()
+          .setColor(0x2ECC71)
+          .setTitle('New Listing!!!')
+          .setDescription(`**${name}** just dropped in the marketplace\n\n🛒 Buy Item in the marketplace to claim it`);
+        await announceChannel.send({ content: `@everyone\n${alertEmoji} **New Listing!!!** ${alertEmoji}`, embeds: [announceEmbed] });
+      } catch (e) {
+        console.error('Failed to send announcement:', e.message);
+      }
+    }
+
     return interaction.reply({ content: `Added **${name}** to the marketplace — ${cost} points, ${spots <= 0 ? 'unlimited' : spots} spots.`, ephemeral: true });
   }
 
