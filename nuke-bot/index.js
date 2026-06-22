@@ -56,7 +56,6 @@ async function initDb() {
 }
 
 async function persist(key, data) {
-  cache[key] = data;
   try {
     await pool.query(
       `INSERT INTO kv_store (key, value) VALUES ($1, $2)
@@ -73,8 +72,10 @@ async function persist(key, data) {
 function load(file) {
   return cache[file] || {};
 }
+
 function save(file, data) {
-  persist(file, data); // fire and forget; cache updates synchronously inside persist()
+  cache[file] = data; // update cache synchronously so next load() sees it immediately
+  persist(file, data); // write to Postgres async in background
 }
 
 function loadPending() { return load(DB_FILE); }
