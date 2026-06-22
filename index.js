@@ -94,26 +94,145 @@ function getDefaultChannel(guildId) {
   return loadSettings()[guildId]?.defaultChannel || null;
 }
 
-// ─── Points Helpers ───────────────────────────────────────────────────────────
+// ─── Memory Bot Leaderboard Sync ───────────────────────────────────────────────
 
-function getPoints(guildId, userId) {
-  return loadPoints()[guildId]?.[userId] || 0;
+function parseLeaderboardText(text) {
+  // Matches lines like: "1. kellvin: 3 points" or "12. PHANTOMX: 2 points"
+  // Strips leading rank number, trailing emoji/badges, and "points" suffix.
+  const lines = text.split('\n');
+  const results = [];
+  const lineRegex = /^\s*\d+\.\s*(.+?)\s*[:\-–]\s*(\d+)\s*points?/i;
+
+  for (const line of lines) {
+    const match = line.match(lineRegex);
+    if (!match) continue;
+    let rawName = match[1].trim();
+    const points = parseInt(match[2], 10);
+
+    // Strip bold markdown, custom emoji tags, and trailing badge emoji/symbols
+    rawName = rawName.replace(/\*\*/g, '');
+    rawName = rawName.replace(/<a?:\w+:\d+>/g, '');
+    rawName = rawName.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, '');
+    rawName = rawName.trim();
+
+    if (rawName && !isNaN(points)) {
+      results.push({ username: rawName, points });
+    }
+  }
+  return results;
 }
 
+async function syncMemoryLeaderboard(guild, sourceChannelId) {
+  try {
+    const channel = await client.channels.fetch(sourceChannelId);
+    const messages = await channel.messages.fetch({ limit: 20 });
+
+    // Find the most recent message from a bot whose embed/content looks like a leaderboard
+    const leaderboardMsg = messages.find(m =>
+      m.author.bot &&
+      (
+        (m.embeds[0]?.title || '').toLowerCase().includes('leaderboard') ||
+        (m.content || '').toLowerCase().includes('leaderboard')
+      )
+    );
+
+    if (!leaderboardMsg) {
+      console.log(`No Memory bot leaderboard message found in #${channel.name}`);
+      return { synced: 0, notFound: [] };
+    }
+
+    const rawText = leaderboardMsg.embeds[0]?.description || leaderboardMsg.content || '';
+    const parsed = parseLeaderboardText(rawText);
+
+    if (parsed.length === 0) return { synced: 0, notFound: [] };
+
+    const members = await guild.members.fetch();
+    const byUsername = new Map();
+    const byDisplayName = new Map();
+    members.forEach(m => {
+      byUsername.set(m.user.username.toLowerCase(), m.id);
+      byDisplayName.set(m.displayName.toLowerCase(), m.id);
+    });
+
+    let synced = 0;
+    const notFound = [];
+
+    for (const { username, points } of parsed) {
+      const lookup = username.toLowerCase();
+      const userId = byUsername.get(lookup) || byDisplayName.get(lookup);
+      if (!userId) {
+        notFound.push(username);
+        continue;
+      }
+      syncEarnedAndCredit(guild.id, userId, points);
+      synced++;
+    }
+
+    return { synced, notFound };
+  } catch (e) {
+    console.error('Leaderboard sync failed:', e.message);
+    return { synced: 0, notFound: [], error: e.message };
+  }
+}
+
+// ─── Points Helpers ───────────────────────────────────────────────────────────
+
+// Points are tracked as { earned, balance } per user.
+// "earned" = lifetime total ever credited from Memory bot syncs (only ever increases, used to
+//            compute deltas on the next import so we never double count).
+// "balance" = actual spendable points right now (goes up when synced, goes down on purchase).
+// /leaderboard shows earned. /points and marketplace purchases use balance.
+
+function getUserPointRecord(guildId, userId) {
+  const pts = loadPoints();
+  return pts[guildId]?.[userId] || { earned: 0, balance: 0 };
+}
+
+// Spendable balance — what marketplace purchases check against
+function getPoints(guildId, userId) {
+  return Math.max(0, getUserPointRecord(guildId, userId).balance);
+}
+
+// Lifetime earned — what /leaderboard shows, and what Memory bot's totals are compared against
+function getEarned(guildId, userId) {
+  return getUserPointRecord(guildId, userId).earned;
+}
+
+// Adds directly to spendable balance only, does NOT touch earned (use for manual /addpoints grants)
 function addPoints(guildId, userId, amount) {
   const pts = loadPoints();
   if (!pts[guildId]) pts[guildId] = {};
-  pts[guildId][userId] = (pts[guildId][userId] || 0) + amount;
+  if (!pts[guildId][userId]) pts[guildId][userId] = { earned: 0, balance: 0 };
+  pts[guildId][userId].balance += amount;
   savePoints(pts);
-  return pts[guildId][userId];
+  return getPoints(guildId, userId);
 }
 
+// Used when importing a new Memory bot leaderboard total for a user:
+// computes the delta vs what they had last sync, adds that delta to balance,
+// then updates earned to the new total so the next sync compares correctly.
+function syncEarnedAndCredit(guildId, userId, newMemoryTotal) {
+  const pts = loadPoints();
+  if (!pts[guildId]) pts[guildId] = {};
+  if (!pts[guildId][userId]) pts[guildId][userId] = { earned: 0, balance: 0 };
+  const prevEarned = pts[guildId][userId].earned;
+  const delta = newMemoryTotal - prevEarned;
+  if (delta > 0) {
+    pts[guildId][userId].balance += delta;
+  }
+  pts[guildId][userId].earned = newMemoryTotal;
+  savePoints(pts);
+  return { delta: Math.max(0, delta), newBalance: getPoints(guildId, userId) };
+}
+
+// Deducts from spendable balance only (use when redeeming a marketplace item)
 function deductPoints(guildId, userId, amount) {
   const pts = loadPoints();
   if (!pts[guildId]) pts[guildId] = {};
-  pts[guildId][userId] = Math.max(0, (pts[guildId][userId] || 0) - amount);
+  if (!pts[guildId][userId]) pts[guildId][userId] = { earned: 0, balance: 0 };
+  pts[guildId][userId].balance = Math.max(0, pts[guildId][userId].balance - amount);
   savePoints(pts);
-  return pts[guildId][userId];
+  return getPoints(guildId, userId);
 }
 
 // ─── HTTP Server (keepalive / health check only) ───────────────────────────────
@@ -370,6 +489,17 @@ const commands = [
     .toJSON(),
 
   new SlashCommandBuilder()
+    .setName('setsyncchannel')
+    .setDescription('Set the channel where Memory bot posts its leaderboard, for auto point sync')
+    .addChannelOption(opt => opt.setName('channel').setDescription('Channel with the Memory bot leaderboard').setRequired(true))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('syncnow')
+    .setDescription('Manually trigger a point sync from Memory bot leaderboard right now')
+    .toJSON(),
+
+  new SlashCommandBuilder()
     .setName('points')
     .setDescription('Check your points balance')
     .toJSON(),
@@ -420,17 +550,8 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('importpoints')
-    .setDescription('Bulk import points from a CSV file (username,points)')
+    .setDescription('Sync points from Memory bot leaderboard CSV (username,points = lifetime total)')
     .addAttachmentOption(opt => opt.setName('file').setDescription('CSV file with username,points per line').setRequired(true))
-    .addStringOption(opt =>
-      opt.setName('mode')
-        .setDescription('How to handle existing points')
-        .setRequired(true)
-        .addChoices(
-          { name: 'Add to existing points', value: 'add' },
-          { name: 'Overwrite existing points', value: 'overwrite' },
-          { name: 'Skip if user already has points', value: 'skip' },
-        ))
     .toJSON(),
 
   new SlashCommandBuilder()
@@ -470,6 +591,21 @@ client.once('clientReady', async () => {
   for (const { contract, channelId } of Object.values(trackers)) {
     startTracker(contract, channelId);
   }
+
+  // Hourly auto-sync of points from Memory bot's leaderboard
+  setInterval(async () => {
+    const settings = loadSettings();
+    for (const [guildId, conf] of Object.entries(settings)) {
+      if (!conf.syncChannel) continue;
+      try {
+        const guild = await client.guilds.fetch(guildId);
+        const result = await syncMemoryLeaderboard(guild, conf.syncChannel);
+        console.log(`Auto-synced ${result.synced} users for guild ${guildId}`);
+      } catch (e) {
+        console.error(`Auto-sync failed for guild ${guildId}:`, e.message);
+      }
+    }
+  }, 60 * 60 * 1000); // every hour
 });
 
 // ─── Member Events ────────────────────────────────────────────────────────────
@@ -878,16 +1014,48 @@ client.on('interactionCreate', async (interaction) => {
     return interaction.followUp({ content: `Sent wallet collection DMs to **${sent}/${missing.length}** buyers. The rest likely have DMs closed.`, ephemeral: true });
   }
 
+  // ── /setsyncchannel ──
+  if (interaction.commandName === 'setsyncchannel') {
+    if (!interaction.member.permissions.has('ManageGuild')) {
+      return interaction.reply({ content: 'You need Manage Server permission.', ephemeral: true });
+    }
+    const channel = interaction.options.getChannel('channel');
+    const settings = loadSettings();
+    settings[interaction.guild.id] = { ...settings[interaction.guild.id], syncChannel: channel.id };
+    saveSettings(settings);
+    return interaction.reply(`Will auto-sync points from Memory bot's leaderboard in <#${channel.id}> every hour. Run \`/syncnow\` to sync immediately.`);
+  }
+
+  // ── /syncnow ──
+  if (interaction.commandName === 'syncnow') {
+    if (!interaction.member.permissions.has('ManageGuild')) {
+      return interaction.reply({ content: 'You need Manage Server permission.', ephemeral: true });
+    }
+    const syncChannelId = loadSettings()[interaction.guild.id]?.syncChannel;
+    if (!syncChannelId) {
+      return interaction.reply({ content: 'Set a sync channel first with `/setsyncchannel`.', ephemeral: true });
+    }
+    await interaction.reply({ content: 'Syncing points from Memory bot leaderboard...', ephemeral: true });
+    const result = await syncMemoryLeaderboard(interaction.guild, syncChannelId);
+    let summary = `✅ Synced **${result.synced}** users' points.`;
+    if (result.notFound?.length > 0) {
+      summary += `\n⚠️ Could not match: ${result.notFound.slice(0, 15).join(', ')}${result.notFound.length > 15 ? '...' : ''}`;
+    }
+    if (result.error) summary = `❌ Sync failed: ${result.error}`;
+    return interaction.followUp({ content: summary, ephemeral: true });
+  }
+
   // ── /points ──
   if (interaction.commandName === 'points') {
     const pts = getPoints(interaction.guild.id, interaction.user.id);
-    return interaction.reply({ content: `You have **${pts} points** in this server.`, ephemeral: true });
+    return interaction.reply({ content: `Your spendable balance: **${pts} points**.`, ephemeral: true });
   }
 
   // ── /leaderboard ──
   if (interaction.commandName === 'leaderboard') {
     const allPts = loadPoints()[interaction.guild.id] || {};
-    const sorted = Object.entries(allPts).sort((a, b) => b[1] - a[1]).slice(0, 10);
+    const earnedList = Object.entries(allPts).map(([uid, rec]) => [uid, rec.earned || 0]);
+    const sorted = earnedList.sort((a, b) => b[1] - a[1]).slice(0, 10);
     if (sorted.length === 0) return interaction.reply({ content: 'No points earned yet.', ephemeral: true });
     const lines = await Promise.all(sorted.map(async ([uid, pts], i) => {
       try {
@@ -1011,7 +1179,7 @@ client.on('interactionCreate', async (interaction) => {
     const user = interaction.options.getUser('user');
     const amount = interaction.options.getInteger('amount');
     const newTotal = addPoints(interaction.guild.id, user.id, amount);
-    return interaction.reply(`Added **${amount}** points to **${user.username}**. New total: **${newTotal}**.`);
+    return interaction.reply(`Added **${amount}** points to **${user.username}**. New balance: **${newTotal}**.`);
   }
 
   // ── /importpoints ──
@@ -1020,7 +1188,6 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.reply({ content: 'You need Manage Server permission.', ephemeral: true });
     }
     const file = interaction.options.getAttachment('file');
-    const mode = interaction.options.getString('mode');
 
     if (!file.name.endsWith('.csv') && !file.name.endsWith('.txt')) {
       return interaction.reply({ content: 'Please upload a .csv or .txt file.', ephemeral: true });
@@ -1042,16 +1209,17 @@ client.on('interactionCreate', async (interaction) => {
         byDisplayName.set(m.displayName.toLowerCase(), m.id);
       });
 
-      let imported = 0;
-      let skipped = 0;
+      let synced = 0;
+      let noChange = 0;
       const notFound = [];
 
       for (const line of lines) {
+        if (line.toLowerCase().startsWith('username,')) continue; // skip header row if present
         const parts = line.split(',').map(p => p.trim());
         if (parts.length < 2) continue;
         const rawName = parts[0].replace(/^["']|["']$/g, '');
-        const pointsVal = parseInt(parts[1].replace(/[^0-9-]/g, ''), 10);
-        if (!rawName || isNaN(pointsVal)) continue;
+        const newTotal = parseInt(parts[1].replace(/[^0-9-]/g, ''), 10);
+        if (!rawName || isNaN(newTotal)) continue;
 
         const lookupName = rawName.toLowerCase();
         const userId = byUsername.get(lookupName) || byDisplayName.get(lookupName);
@@ -1061,26 +1229,16 @@ client.on('interactionCreate', async (interaction) => {
           continue;
         }
 
-        const existing = getPoints(interaction.guild.id, userId);
-
-        if (mode === 'skip' && existing > 0) {
-          skipped++;
-          continue;
-        }
-
-        if (mode === 'overwrite') {
-          const pts = loadPoints();
-          if (!pts[interaction.guild.id]) pts[interaction.guild.id] = {};
-          pts[interaction.guild.id][userId] = pointsVal;
-          savePoints(pts);
+        const { delta } = syncEarnedAndCredit(interaction.guild.id, userId, newTotal);
+        if (delta > 0) {
+          synced++;
         } else {
-          addPoints(interaction.guild.id, userId, pointsVal);
+          noChange++;
         }
-        imported++;
       }
 
-      let summary = `✅ Imported points for **${imported}** users.`;
-      if (skipped > 0) summary += `\n⏭️ Skipped **${skipped}** users who already had points.`;
+      let summary = `✅ Synced **${synced}** users with new points credited to their balance.`;
+      if (noChange > 0) summary += `\n➖ **${noChange}** users had no change (already up to date).`;
       if (notFound.length > 0) {
         summary += `\n⚠️ Could not match **${notFound.length}** username(s) to a server member: ${notFound.slice(0, 15).join(', ')}${notFound.length > 15 ? '...' : ''}`;
       }
@@ -1105,13 +1263,15 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.editReply('No points data to export yet.');
     }
 
-    const rows = ['username,points'];
-    for (const [userId, pts] of entries) {
+    const rows = ['username,earned,balance'];
+    for (const [userId, rec] of entries) {
+      const earned = rec.earned || 0;
+      const balance = Math.max(0, rec.balance || 0);
       try {
         const user = await client.users.fetch(userId);
-        rows.push(`${user.username},${pts}`);
+        rows.push(`${user.username},${earned},${balance}`);
       } catch {
-        rows.push(`${userId},${pts}`);
+        rows.push(`${userId},${earned},${balance}`);
       }
     }
 
