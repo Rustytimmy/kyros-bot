@@ -185,7 +185,11 @@ async function syncMemoryLeaderboard(guild, sourceChannelId) {
 
 function getUserPointRecord(guildId, userId) {
   const pts = loadPoints();
-  return pts[guildId]?.[userId] || { earned: 0, balance: 0 };
+  const rec = pts[guildId]?.[userId];
+  if (!rec) return { earned: 0, balance: 0 };
+  // Handle legacy flat number records from before earned/balance structure
+  if (typeof rec === 'number') return { earned: rec, balance: rec };
+  return { earned: rec.earned || 0, balance: rec.balance || 0 };
 }
 
 // Spendable balance — what marketplace purchases check against
