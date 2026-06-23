@@ -165,7 +165,7 @@ async function syncMemoryLeaderboard(guild, sourceChannelId) {
         notFound.push(username);
         continue;
       }
-      syncEarnedAndCredit(guild.id, userId, points);
+      syncPoints(guild.id, userId, points);
       synced++;
     }
 
@@ -177,67 +177,70 @@ async function syncMemoryLeaderboard(guild, sourceChannelId) {
 }
 
 // ─── Points Helpers ───────────────────────────────────────────────────────────
+//
+// Each user record: { lifetime, balance }
+// lifetime = total ever earned. Only increases. Used to compute import deltas.
+// balance  = spendable points right now.
+//
+// /points and /leaderboard show balance.
+// /addpoints adds to BOTH balance and lifetime.
+// Import: delta = newTotal - lifetime. Add delta to balance. Set lifetime = newTotal.
+// Purchase: deduct from balance only. lifetime unchanged.
 
-// Points are tracked as { earned, balance } per user.
-// "earned" = lifetime total ever credited from Memory bot syncs (only ever increases, used to
-//            compute deltas on the next import so we never double count).
-// "balance" = actual spendable points right now (goes up when synced, goes down on purchase).
-// /leaderboard shows earned. /points and marketplace purchases use balance.
-
-function getUserPointRecord(guildId, userId) {
+function getUserRecord(guildId, userId) {
   const pts = loadPoints();
   const rec = pts[guildId]?.[userId];
-  if (!rec) return { earned: 0, balance: 0 };
-  // Handle legacy flat number records from before earned/balance structure
-  if (typeof rec === 'number') return { earned: rec, balance: rec };
-  return { earned: rec.earned || 0, balance: rec.balance || 0 };
+  if (!rec) return { lifetime: 0, balance: 0 };
+  if (typeof rec === 'number') return { lifetime: rec, balance: rec };
+  // Handle old earned/spent or earned/balance structures
+  if (rec.earned !== undefined) return { lifetime: rec.earned, balance: rec.balance || 0 };
+  return { lifetime: rec.lifetime || 0, balance: rec.balance || 0 };
 }
 
-// Spendable balance — what marketplace purchases check against
+function saveUserRecord(guildId, userId, record) {
+  const pts = loadPoints();
+  if (!pts[guildId]) pts[guildId] = {};
+  pts[guildId][userId] = record;
+  savePoints(pts);
+}
+
+// Spendable balance
 function getPoints(guildId, userId) {
-  return Math.max(0, getUserPointRecord(guildId, userId).balance);
+  return getUserRecord(guildId, userId).balance;
 }
 
-// Lifetime earned — what /leaderboard shows, and what Memory bot's totals are compared against
-function getEarned(guildId, userId) {
-  return getUserPointRecord(guildId, userId).earned;
+// Lifetime total
+function getLifetime(guildId, userId) {
+  return getUserRecord(guildId, userId).lifetime;
 }
 
-// Adds directly to spendable balance only, does NOT touch earned (use for manual /addpoints grants)
+// /addpoints: adds to both balance and lifetime
 function addPoints(guildId, userId, amount) {
-  const pts = loadPoints();
-  if (!pts[guildId]) pts[guildId] = {};
-  if (!pts[guildId][userId]) pts[guildId][userId] = { earned: 0, balance: 0 };
-  pts[guildId][userId].balance += amount;
-  savePoints(pts);
-  return getPoints(guildId, userId);
+  const rec = getUserRecord(guildId, userId);
+  rec.balance += amount;
+  rec.lifetime += amount;
+  saveUserRecord(guildId, userId, rec);
+  return rec.balance;
 }
 
-// Used when importing a new Memory bot leaderboard total for a user:
-// computes the delta vs what they had last sync, adds that delta to balance,
-// then updates earned to the new total so the next sync compares correctly.
-function syncEarnedAndCredit(guildId, userId, newMemoryTotal) {
-  const pts = loadPoints();
-  if (!pts[guildId]) pts[guildId] = {};
-  if (!pts[guildId][userId]) pts[guildId][userId] = { earned: 0, balance: 0 };
-  const prevEarned = pts[guildId][userId].earned;
-  const delta = newMemoryTotal - prevEarned;
+// Import sync: adds delta to balance, updates lifetime
+function syncPoints(guildId, userId, newMemoryTotal) {
+  const rec = getUserRecord(guildId, userId);
+  const delta = newMemoryTotal - rec.lifetime;
   if (delta > 0) {
-    pts[guildId][userId].balance += delta;
+    rec.balance += delta;
+    rec.lifetime = newMemoryTotal;
   }
-  pts[guildId][userId].earned = newMemoryTotal;
-  savePoints(pts);
-  return { delta: Math.max(0, delta), newBalance: getPoints(guildId, userId) };
+  saveUserRecord(guildId, userId, rec);
+  return { delta: Math.max(0, delta), balance: rec.balance };
 }
 
-// Deducts from spendable balance only (use when redeeming a marketplace item)
+// Purchase: deduct from balance only, lifetime unchanged
 function deductPoints(guildId, userId, amount) {
-  const pts = loadPoints();
-  if (!pts[guildId]) pts[guildId] = {};
-  if (!pts[guildId][userId]) pts[guildId][userId] = { earned: 0, balance: 0 };
-  pts[guildId][userId].balance = Math.max(0, pts[guildId][userId].balance - amount);
-  savePoints(pts);
-  return getPoints(guildId, userId);
+  const rec = getUserRecord(guildId, userId);
+  rec.balance = Math.max(0, rec.balance - amount);
+  saveUserRecord(guildId, userId, rec);
+  return rec.balance;
 }
 
 // ─── HTTP Server (keepalive / health check only) ───────────────────────────────
@@ -1059,8 +1062,11 @@ client.on('interactionCreate', async (interaction) => {
   // ── /leaderboard ──
   if (interaction.commandName === 'leaderboard') {
     const allPts = loadPoints()[interaction.guild.id] || {};
-    const earnedList = Object.entries(allPts).map(([uid, rec]) => [uid, rec.earned || 0]);
-    const sorted = earnedList.sort((a, b) => b[1] - a[1]).slice(0, 10);
+    const balanceList = Object.entries(allPts).map(([uid, rec]) => {
+      const r = getUserRecord(interaction.guild.id, uid);
+      return [uid, r.balance];
+    });
+    const sorted = balanceList.sort((a, b) => b[1] - a[1]).slice(0, 10);
     if (sorted.length === 0) return interaction.reply({ content: 'No points earned yet.', ephemeral: true });
     const lines = await Promise.all(sorted.map(async ([uid, pts], i) => {
       try {
@@ -1234,7 +1240,7 @@ client.on('interactionCreate', async (interaction) => {
           continue;
         }
 
-        const { delta } = syncEarnedAndCredit(interaction.guild.id, userId, newTotal);
+        const { delta } = syncPoints(interaction.guild.id, userId, newTotal);
         if (delta > 0) {
           synced++;
         } else {
@@ -1268,15 +1274,14 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.editReply('No points data to export yet.');
     }
 
-    const rows = ['username,earned,balance'];
-    for (const [userId, rec] of entries) {
-      const earned = rec.earned || 0;
-      const balance = Math.max(0, rec.balance || 0);
+    const rows = ['username,lifetime,balance'];
+    for (const [userId] of entries) {
+      const r = getUserRecord(interaction.guild.id, userId);
       try {
         const user = await client.users.fetch(userId);
-        rows.push(`${user.username},${earned},${balance}`);
+        rows.push(`${user.username},${r.lifetime},${r.balance}`);
       } catch {
-        rows.push(`${userId},${earned},${balance}`);
+        rows.push(`${userId},${r.lifetime},${r.balance}`);
       }
     }
 
