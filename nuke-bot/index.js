@@ -556,6 +556,13 @@ const commands = [
     .addIntegerOption(opt => opt.setName('amount').setDescription('Points to add').setRequired(true))
     .toJSON(),
 
+new SlashCommandBuilder()
+    .setName('removeuserpoints')
+    .setDescription('Remove points from a user\'s balance')
+    .addUserOption(opt => opt.setName('user').setDescription('User to remove points from').setRequired(true))
+    .addIntegerOption(opt => opt.setName('amount').setDescription('Points to remove').setRequired(true))
+    .toJSON(),
+
   new SlashCommandBuilder()
     .setName('importpoints')
     .setDescription('Sync points from Memory bot leaderboard CSV (username,points = lifetime total)')
@@ -663,12 +670,11 @@ client.on('interactionCreate', async (interaction) => {
     const menu = new StringSelectMenuBuilder()
       .setCustomId('buy_item_select')
       .setPlaceholder('Choose an item to buy')
-      .addOptions(available.map(([id, item]) => ({
-        label: `${item.name} — ${item.cost} pts`,
-        description: item.spots === -1 ? 'Unlimited spots' : `${item.spots - (item.claimedBy?.length || 0)} spots left`,
-        value: id,
-      })));
-
+     .addOptions(available.map(([id, item]) => ({
+    label: `${item.name} — ${item.cost} pts`.slice(0, 100),
+    description: (item.spots === -1 ? 'Unlimited spots' : `${item.spots - (item.claimedBy?.length || 0)} spots left`).slice(0, 100),
+    value: id,
+})));
     const row = new ActionRowBuilder().addComponents(menu);
     return interaction.reply({ content: 'Select an item to redeem:', components: [row], ephemeral: true });
   }
@@ -1123,6 +1129,14 @@ client.on('interactionCreate', async (interaction) => {
     const role = interaction.options.getRole('role');
     const spots = interaction.options.getInteger('spots');
 
+const label = `${name} — ${cost} pts`;
+if (label.length > 100) {
+  return interaction.reply({ 
+    content: `❌ Item name is too long. The name + cost combined must be under **${100 - ` — ${cost} pts`.length} characters**. Your name is **${name.length} characters** — shorten it by **${label.length - 100}**.`, 
+    ephemeral: true 
+  });
+}
+
     const market = loadMarket();
     if (!market[interaction.guild.id]) market[interaction.guild.id] = { items: {} };
     const itemId = crypto.randomBytes(6).toString('hex');
@@ -1192,6 +1206,20 @@ client.on('interactionCreate', async (interaction) => {
     const newTotal = addPoints(interaction.guild.id, user.id, amount);
     return interaction.reply(`Added **${amount}** points to **${user.username}**. New balance: **${newTotal}**.`);
   }
+
+if (interaction.commandName === 'removeuserpoints') {
+    if (!interaction.member.permissions.has('ManageGuild')) {
+        return interaction.reply({ content: 'You need Manage Server permission.', ephemeral: true });
+    }
+    const user = interaction.options.getUser('user');
+    const amount = interaction.options.getInteger('amount');
+    const newBalance = deductPoints(interaction.guild.id, user.id, amount);
+    // Also reduce lifetime so future syncs don't re-add it
+    const rec = getUserRecord(interaction.guild.id, user.id);
+    rec.lifetime = Math.max(0, rec.lifetime - amount);
+    saveUserRecord(interaction.guild.id, user.id, rec);
+    return interaction.reply({ content: `Removed **${amount}** points from **${user.username}**. New balance: **${newBalance}**.`, ephemeral: true });
+}
 
   // ── /importpoints ──
   if (interaction.commandName === 'importpoints') {
