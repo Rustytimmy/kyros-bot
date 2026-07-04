@@ -510,6 +510,7 @@ const commands = [
   new SlashCommandBuilder()
     .setName('points')
     .setDescription('Check your points balance')
+    .addUserOption(opt => opt.setName('user').setDescription('User to check (leave blank for yourself)').setRequired(false))
     .toJSON(),
 
   new SlashCommandBuilder()
@@ -1060,10 +1061,17 @@ client.on('interactionCreate', async (interaction) => {
   }
 
   // ── /points ──
-  if (interaction.commandName === 'points') {
-    const pts = getPoints(interaction.guild.id, interaction.user.id);
-    return interaction.reply({ content: `Your spendable balance: **${pts} points**.`, ephemeral: true });
-  }
+ if (interaction.commandName === 'points') {
+    const target = interaction.options.getUser('user') || interaction.user;
+    const pts = getPoints(interaction.guild.id, target.id);
+    const isOwnBalance = target.id === interaction.user.id;
+    return interaction.reply({ 
+        content: isOwnBalance 
+            ? `Your spendable balance: **${pts} points**.` 
+            : `**${target.username}** has **${pts} points**.`, 
+        ephemeral: true 
+    });
+}
 
   // ── /leaderboard ──
   if (interaction.commandName === 'leaderboard') {
