@@ -33,6 +33,9 @@ const SETTINGS_FILE = 'settings';
 const POINTS_FILE = 'points';
 const MARKET_FILE = 'market';
 const WALLET_FILE = 'wallets';
+const RAID_STATE_FILE = 'raidstate';
+const PENALTY_FILE = 'penalties';
+const PENALTY_HOURS = 24;
 const COOLDOWN_SECONDS = 10;
 const cooldowns = new Map();
 const trackerIntervals = new Map();
@@ -90,6 +93,10 @@ function loadMarket() { return load(MARKET_FILE); }
 function saveMarket(d) { save(MARKET_FILE, d); }
 function loadWallets() { return load(WALLET_FILE); }
 function saveWallets(d) { save(WALLET_FILE, d); }
+function loadRaidState() { return load(RAID_STATE_FILE); }
+function saveRaidState(d) { save(RAID_STATE_FILE, d); }
+function loadPenalties() { return load(PENALTY_FILE); }
+function savePenalties(d) { save(PENALTY_FILE, d); }
 
 function getDefaultChannel(guildId) {
   return loadSettings()[guildId]?.defaultChannel || null;
@@ -424,6 +431,180 @@ async function scheduleKick(userId, remaining) {
   }, remaining);
 }
 
+// ─── Raid Verification Helpers ─────────────────────────────────────────────────
+//
+// X Roles are named "Raiders X<N>" (e.g. "Raiders X1", "Raiders X5"). A user's
+// required proof count is the SUM of every matching X role's number.
+//
+// raidstate[guildId] = { timestamp, submitted: { userId: true } }
+//   - timestamp resets whenever an admin posts in the configured raid channel
+//   - submitted tracks who has already had their one shot at proof for this raid
+//
+// penalties[guildId][userId] = { xRoles: [{id,name,count}], timestamp, accessRestored }
+//   - xRoles are the previous X roles being held in escrow during the penalty
+//   - accessRestored flips true once the 24h auto-restore has run
+
+const X_ROLE_REGEX = /^Raiders X(\d+)$/i;
+
+function getXRoles(member) {
+  return member.roles.cache
+    .filter(r => X_ROLE_REGEX.test(r.name))
+    .map(r => ({ id: r.id, name: r.name, count: parseInt(r.name.match(X_ROLE_REGEX)[1], 10) }));
+}
+
+function sumRequired(xRoles) {
+  return xRoles.reduce((sum, r) => sum + r.count, 0);
+}
+
+function extractTwitterLinks(text) {
+  const matches = text.match(/https?:\/\/(?:www\.)?(?:twitter\.com|x\.com)\/\S+/gi) || [];
+  return [...new Set(matches.map(m => m.replace(/[)\]}>.,!?'"]+$/, '')))]; // dedupe + strip trailing punctuation
+}
+
+function getPenalty(guildId, userId) {
+  return loadPenalties()[guildId]?.[userId] || null;
+}
+
+function setPenalty(guildId, userId, penalty) {
+  const all = loadPenalties();
+  if (!all[guildId]) all[guildId] = {};
+  all[guildId][userId] = penalty;
+  savePenalties(all);
+}
+
+function clearPenalty(guildId, userId) {
+  const all = loadPenalties();
+  if (all[guildId]) delete all[guildId][userId];
+  savePenalties(all);
+}
+
+async function dmSafe(userId, payload) {
+  try {
+    const user = await client.users.fetch(userId);
+    await user.send(payload);
+  } catch {
+    // DMs closed, nothing more we can do
+  }
+}
+
+async function handleRaidPost(message) {
+  const settings = loadSettings();
+  const conf = settings[message.guild.id];
+  if (!conf?.raidChannel || message.channel.id !== conf.raidChannel) return;
+  if (message.author.bot) return;
+  if (!message.member.permissions.has('ManageGuild')) return;
+
+  const raidState = loadRaidState();
+  raidState[message.guild.id] = { timestamp: Date.now(), submitted: {} };
+  saveRaidState(raidState);
+}
+
+async function handleProofSubmission(message) {
+  const settings = loadSettings();
+  const conf = settings[message.guild.id];
+  if (!conf?.proofChannel || message.channel.id !== conf.proofChannel) return;
+  if (message.author.bot) return;
+
+  const raidState = loadRaidState();
+  const raid = raidState[message.guild.id];
+
+  // No active raid recorded yet — nothing to verify against.
+  if (!raid?.timestamp) return;
+
+  // Only the first message per user per raid counts. Edits are never re-checked
+  // since we only listen on messageCreate, and resubmissions are blocked here.
+  if (raid.submitted[message.author.id]) return;
+  raid.submitted[message.author.id] = true;
+  saveRaidState(raidState);
+
+  const member = message.member;
+  const guildId = message.guild.id;
+  const links = extractTwitterLinks(message.content);
+  const submittedCount = links.length;
+
+  const penalty = getPenalty(guildId, member.id);
+  const isReclaimAttempt = !!penalty;
+  const requiredCount = isReclaimAttempt ? sumRequired(penalty.xRoles) : sumRequired(getXRoles(member));
+
+  const passed = submittedCount >= requiredCount;
+
+  try {
+    await message.react(passed ? '✅' : '❌');
+  } catch {}
+
+  if (passed) {
+    if (isReclaimAttempt) {
+      // Restore previous X roles, clear the penalty, keep Access Role.
+      for (const role of penalty.xRoles) {
+        try { await member.roles.add(role.id); } catch {}
+      }
+      clearPenalty(guildId, member.id);
+      await dmSafe(member.id, {
+        content: `✅ You submitted **${submittedCount}/${requiredCount}** required proofs and reclaimed your **${penalty.xRoles.map(r => r.name).join(', ')}** role(s) in **${message.guild.name}**. You're fully back in.`,
+      });
+    }
+    // First-time pass: nothing changes, they keep everything.
+    return;
+  }
+
+  // ── Failure path ──
+  if (isReclaimAttempt) {
+    // Failed the reclaim attempt: remove Access Role again, X roles stay removed,
+    // start a fresh 24h penalty window on the SAME stored X roles.
+    if (conf.accessRole) {
+      try { await member.roles.remove(conf.accessRole); } catch {}
+    }
+    setPenalty(guildId, member.id, { xRoles: penalty.xRoles, timestamp: Date.now(), accessRestored: false });
+    await dmSafe(member.id, {
+      content: `❌ You submitted **${submittedCount}/${requiredCount}** required proofs and failed your reclaim attempt in **${message.guild.name}**. Access Role removed again. You can try again in 24 hours.`,
+    });
+    return;
+  }
+
+  // First-time failure: capture current X roles, strip both roles, store penalty.
+  const xRoles = getXRoles(member);
+  for (const role of xRoles) {
+    try { await member.roles.remove(role.id); } catch {}
+  }
+  if (conf.accessRole) {
+    try { await member.roles.remove(conf.accessRole); } catch {}
+  }
+  setPenalty(guildId, member.id, { xRoles, timestamp: Date.now(), accessRestored: false });
+
+  await dmSafe(member.id, {
+    content: `❌ You submitted **${submittedCount}/${requiredCount}** required proofs in **${message.guild.name}** and lost your **${xRoles.map(r => r.name).join(', ') || 'X'}** role(s) and Access Role.\n\nIn 24 hours your Access Role will be restored automatically. Submit the required proofs on the next raid to earn your X role(s) back.`,
+  });
+}
+
+async function runPenaltyRestoreSweep() {
+  const allPenalties = loadPenalties();
+  const settings = loadSettings();
+  const now = Date.now();
+
+  for (const [guildId, userPenalties] of Object.entries(allPenalties)) {
+    const conf = settings[guildId];
+    if (!conf?.accessRole) continue;
+
+    for (const [userId, penalty] of Object.entries(userPenalties)) {
+      if (penalty.accessRestored) continue;
+      if (now - penalty.timestamp < PENALTY_HOURS * 60 * 60 * 1000) continue;
+
+      try {
+        const guild = await client.guilds.fetch(guildId);
+        const member = await guild.members.fetch(userId);
+        await member.roles.add(conf.accessRole);
+        penalty.accessRestored = true;
+        setPenalty(guildId, userId, penalty);
+        await dmSafe(userId, {
+          content: `Your Access Role has been restored in **${guild.name}**. Your X role(s) are still pending — submit the required proofs on the next raid to earn them back.`,
+        });
+      } catch (e) {
+        console.error(`Penalty restore failed for ${userId} in ${guildId}:`, e.message);
+      }
+    }
+  }
+}
+
 // ─── Slash Commands ───────────────────────────────────────────────────────────
 
 const commands = [
@@ -574,6 +755,25 @@ new SlashCommandBuilder()
     .setName('exportpoints')
     .setDescription('Export all points in this server as a CSV file')
     .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('setraidconfig')
+    .setDescription('Configure the raid verification system')
+    .addChannelOption(opt => opt.setName('raid-channel').setDescription('Channel where admins post raids').setRequired(true))
+    .addChannelOption(opt => opt.setName('proof-channel').setDescription('Channel where users submit proof links').setRequired(true))
+    .addRoleOption(opt => opt.setName('access-role').setDescription('Role required to post proofs').setRequired(true))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('raidstatus')
+    .setDescription('Show the current raid window and who is currently penalized')
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('clearpenalty')
+    .setDescription('Manually clear a user\'s raid penalty and restore their roles')
+    .addUserOption(opt => opt.setName('user').setDescription('User to clear').setRequired(true))
+    .toJSON(),
 ];
 
 const rest = new REST({ version: '10' }).setToken(TOKEN);
@@ -622,6 +822,10 @@ client.once('clientReady', async () => {
       }
     }
   }, 60 * 60 * 1000); // every hour
+
+  // Hourly sweep to auto-restore Access Role for expired raid penalties
+  runPenaltyRestoreSweep();
+  setInterval(runPenaltyRestoreSweep, 60 * 60 * 1000);
 });
 
 // ─── Member Events ────────────────────────────────────────────────────────────
@@ -636,6 +840,20 @@ client.on('guildMemberUpdate', (oldMember, newMember) => {
   if (newMember.roles.cache.size > 1) {
     const pending = loadPending();
     if (pending[newMember.id]) { delete pending[newMember.id]; savePending(pending); }
+  }
+});
+
+// ─── Raid Verification Message Listener ────────────────────────────────────────
+// Kept as its own listener (separate from the AI chat one below) so raid/proof
+// channel logic runs regardless of whether the bot was mentioned.
+
+client.on('messageCreate', async (message) => {
+  if (!message.guild || message.author.bot) return;
+  try {
+    await handleRaidPost(message);
+    await handleProofSubmission(message);
+  } catch (e) {
+    console.error('Raid verification error:', e.message);
   }
 });
 
@@ -1328,6 +1546,94 @@ if (interaction.commandName === 'removeuserpoints') {
       content: `Exported **${entries.length}** users' points.`,
       files: [{ attachment: buffer, name: `kyros-points-${interaction.guild.id}.csv` }]
     });
+  }
+
+  // ── /setraidconfig ──
+  if (interaction.commandName === 'setraidconfig') {
+    if (!interaction.member.permissions.has('ManageGuild')) {
+      return interaction.reply({ content: 'You need Manage Server permission.', ephemeral: true });
+    }
+    const raidChannel = interaction.options.getChannel('raid-channel');
+    const proofChannel = interaction.options.getChannel('proof-channel');
+    const accessRole = interaction.options.getRole('access-role');
+
+    const settings = loadSettings();
+    settings[interaction.guild.id] = {
+      ...settings[interaction.guild.id],
+      raidChannel: raidChannel.id,
+      proofChannel: proofChannel.id,
+      accessRole: accessRole.id,
+    };
+    saveSettings(settings);
+
+    return interaction.reply({
+      content: `✅ Raid verification configured:\n• Raid channel: <#${raidChannel.id}>\n• Proof channel: <#${proofChannel.id}>\n• Access Role: <@&${accessRole.id}>\n\nAny message posted in the raid channel by someone with Manage Server permission now opens a new proof window. X role requirements are read from roles named \`Raiders X<N>\` (summed if a user has more than one).`,
+      ephemeral: true,
+    });
+  }
+
+  // ── /raidstatus ──
+  if (interaction.commandName === 'raidstatus') {
+    const guildId = interaction.guild.id;
+    const conf = loadSettings()[guildId];
+    if (!conf?.raidChannel) {
+      return interaction.reply({ content: 'Raid verification isn\'t configured yet. Run `/setraidconfig` first.', ephemeral: true });
+    }
+
+    const raid = loadRaidState()[guildId];
+    const penalties = loadPenalties()[guildId] || {};
+    const penaltyEntries = Object.entries(penalties);
+
+    let msg = `**Raid Channel:** <#${conf.raidChannel}>\n**Proof Channel:** <#${conf.proofChannel}>\n**Access Role:** <@&${conf.accessRole}>\n\n`;
+    if (raid?.timestamp) {
+      const submittedCount = Object.keys(raid.submitted || {}).length;
+      msg += `**Current raid window:** started <t:${Math.floor(raid.timestamp / 1000)}:R>, ${submittedCount} submission(s) so far.\n\n`;
+    } else {
+      msg += `**Current raid window:** none active.\n\n`;
+    }
+
+    if (penaltyEntries.length === 0) {
+      msg += 'No users are currently penalized.';
+    } else {
+      const lines = penaltyEntries.map(([userId, p]) => {
+        const remainingMs = Math.max(0, (p.timestamp + PENALTY_HOURS * 60 * 60 * 1000) - Date.now());
+        const status = p.accessRestored ? 'Access restored, awaiting X role reclaim' : `Access locked, restores <t:${Math.floor((p.timestamp + PENALTY_HOURS * 60 * 60 * 1000) / 1000)}:R>`;
+        return `<@${userId}> — lost ${p.xRoles.map(r => r.name).join(', ') || 'X role(s)'} — ${status}`;
+      });
+      msg += `**Penalized users (${penaltyEntries.length}):**\n${lines.join('\n')}`;
+    }
+
+    return interaction.reply({ content: msg, ephemeral: true });
+  }
+
+  // ── /clearpenalty ──
+  if (interaction.commandName === 'clearpenalty') {
+    if (!interaction.member.permissions.has('ManageGuild')) {
+      return interaction.reply({ content: 'You need Manage Server permission.', ephemeral: true });
+    }
+    const user = interaction.options.getUser('user');
+    const guildId = interaction.guild.id;
+    const penalty = getPenalty(guildId, user.id);
+
+    if (!penalty) {
+      return interaction.reply({ content: `${user.username} has no active raid penalty.`, ephemeral: true });
+    }
+
+    const conf = loadSettings()[guildId];
+    try {
+      const member = await interaction.guild.members.fetch(user.id);
+      for (const role of penalty.xRoles) {
+        try { await member.roles.add(role.id); } catch {}
+      }
+      if (conf?.accessRole) {
+        try { await member.roles.add(conf.accessRole); } catch {}
+      }
+    } catch {}
+
+    clearPenalty(guildId, user.id);
+    await dmSafe(user.id, { content: `Your raid penalty in **${interaction.guild.name}** was manually cleared by an admin. Your roles have been restored.` });
+
+    return interaction.reply({ content: `Cleared penalty for **${user.username}** and restored their roles.`, ephemeral: true });
   }
 });
 
