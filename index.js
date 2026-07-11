@@ -13,6 +13,10 @@ const client = new Client({
   ]
 });
 
+client.on('error', (e) => console.error('Client error:', e.message));
+client.on('shardError', (e) => console.error('Shard error:', e.message));
+client.on('warn', (msg) => console.warn('Client warning:', msg));
+
 const TOKEN = process.env.TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
@@ -353,6 +357,59 @@ function stopTracker(contract, channelId) {
     return true;
   }
   return false;
+}
+
+// ─── Leaderboard ──────────────────────────────────────────────────────────────
+
+const LEADERBOARD_PAGE_SIZE = 10;
+
+async function buildLeaderboardPayload(guildId, page) {
+  const allPts = loadPoints()[guildId] || {};
+
+  const balanceList = Object.entries(allPts).map(([uid, rec]) => {
+    let balance;
+    if (typeof rec === 'number') balance = rec;
+    else balance = rec.balance || 0;
+    return [uid, balance];
+  });
+
+  const fullSorted = balanceList.sort((a, b) => b[1] - a[1]);
+  const totalPages = Math.max(1, Math.ceil(fullSorted.length / LEADERBOARD_PAGE_SIZE));
+  const clampedPage = Math.min(Math.max(page, 1), totalPages);
+  const startIdx = (clampedPage - 1) * LEADERBOARD_PAGE_SIZE;
+  const pageSlice = fullSorted.slice(startIdx, startIdx + LEADERBOARD_PAGE_SIZE);
+
+  if (fullSorted.length === 0) {
+    return { embeds: [], components: [], empty: true };
+  }
+
+  const lines = await Promise.all(pageSlice.map(async ([uid, pts], i) => {
+    try {
+      const user = await client.users.fetch(uid);
+      return `${startIdx + i + 1}. **${user.username}** — ${pts} pts`;
+    } catch { return `${startIdx + i + 1}. Unknown — ${pts} pts`; }
+  }));
+
+  const embed = new EmbedBuilder()
+    .setColor(0xFFD700)
+    .setTitle('🏆 Points Leaderboard')
+    .setDescription(lines.join('\n'))
+    .setFooter({ text: `Page ${clampedPage}/${totalPages}` });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`lb_page:${guildId}:${clampedPage - 1}`)
+      .setLabel('◀ Back')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(clampedPage <= 1),
+    new ButtonBuilder()
+      .setCustomId(`lb_page:${guildId}:${clampedPage + 1}`)
+      .setLabel('Forward ▶')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(clampedPage >= totalPages),
+  );
+
+  return { embeds: [embed], components: [row], empty: false };
 }
 
 // ─── Marketplace ──────────────────────────────────────────────────────────────
@@ -876,6 +933,15 @@ client.on('interactionCreate', async (interaction) => {
     return;
   }
 
+  // ── Leaderboard: Back/Forward pagination ──
+  if (interaction.isButton() && interaction.customId.startsWith('lb_page:')) {
+    const [, guildId, pageStr] = interaction.customId.split(':');
+    const targetPage = parseInt(pageStr, 10);
+    const payload = await buildLeaderboardPayload(guildId, targetPage);
+    if (payload.empty) return interaction.update({ content: 'No points earned yet.', embeds: [], components: [] });
+    return interaction.update({ embeds: payload.embeds, components: payload.components });
+  }
+
   // ── Marketplace: Open item picker ──
   if (interaction.isButton() && interaction.customId === 'buy_item_open') {
     const market = loadMarket();
@@ -1293,25 +1359,9 @@ client.on('interactionCreate', async (interaction) => {
 
   // ── /leaderboard ──
   if (interaction.commandName === 'leaderboard') {
-    const allPts = loadPoints()[interaction.guild.id] || {};
-    const balanceList = Object.entries(allPts).map(([uid, rec]) => {
-      const r = getUserRecord(interaction.guild.id, uid);
-      return [uid, r.balance];
-    });
-    const sorted = balanceList.sort((a, b) => b[1] - a[1]).slice(0, 10);
-    if (sorted.length === 0) return interaction.reply({ content: 'No points earned yet.', ephemeral: true });
-    const lines = await Promise.all(sorted.map(async ([uid, pts], i) => {
-      try {
-        const user = await client.users.fetch(uid);
-        return `${i + 1}. **${user.username}** — ${pts} pts`;
-      } catch { return `${i + 1}. Unknown — ${pts} pts`; }
-    }));
-    const embed = new EmbedBuilder()
-      .setColor(0xFFD700)
-      .setTitle('🏆 Points Leaderboard')
-      .setDescription(lines.join('\n'))
-      .setFooter({ text: interaction.guild.name });
-    return interaction.reply({ embeds: [embed] });
+    const payload = await buildLeaderboardPayload(interaction.guild.id, 1);
+    if (payload.empty) return interaction.reply({ content: 'No points earned yet.', ephemeral: true });
+    return interaction.reply({ embeds: payload.embeds, components: payload.components });
   }
 
   // ── /setmarket ──
