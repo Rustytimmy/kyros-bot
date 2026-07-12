@@ -552,7 +552,7 @@ async function handleRaidPost(message) {
   if (!message.member.permissions.has('ManageGuild')) return;
 
   const raidState = loadRaidState();
-  raidState[message.guild.id] = { timestamp: Date.now(), submitted: {} };
+  raidState[message.guild.id] = { timestamp: Date.now(), submitted: {}, startedBy: message.author.id };
   saveRaidState(raidState);
 }
 
@@ -581,7 +581,41 @@ async function handleProofSubmission(message) {
 
   const penalty = getPenalty(guildId, member.id);
   const isReclaimAttempt = !!penalty;
-  const requiredCount = isReclaimAttempt ? sumRequired(penalty.xRoles) : sumRequired(getXRoles(member));
+  const currentXRoles = getXRoles(member);
+
+  // ── New raider onboarding ──
+  // No X roles yet and not mid-penalty means this is their first-ever drop.
+  // Grant Access Role + the exact Raiders X<N> role matching their link count,
+  // instead of running them through the normal pass/fail check (which would
+  // read requiredCount as 0 and wrongly "pass" them with nothing granted).
+  // No congrats/pending DM goes to the raider — reactions only. The configured
+  // notify-admin gets pinged only when a matching Raiders X<N> role is missing.
+  if (!isReclaimAttempt && currentXRoles.length === 0) {
+    if (submittedCount === 0) {
+      try { await message.react('❌'); } catch {}
+      return;
+    }
+
+    const targetRoleName = `Raiders X${submittedCount}`;
+    const matchedRole = message.guild.roles.cache.find(r => r.name.toLowerCase() === targetRoleName.toLowerCase());
+
+    try { await message.react('✅'); } catch {}
+
+    if (conf.accessRole) {
+      try { await member.roles.add(conf.accessRole); } catch {}
+    }
+
+    if (matchedRole) {
+      try { await member.roles.add(matchedRole.id); } catch {}
+    } else if (conf.notifyAdmin) {
+      await dmSafe(conf.notifyAdmin, {
+        content: `⚠️ New raider <@${member.id}> dropped **${submittedCount}** link(s) in **${message.guild.name}**, but there's no **${targetRoleName}** role. Create it and assign it to them manually — they've already been given Access.`,
+      });
+    }
+    return;
+  }
+
+  const requiredCount = isReclaimAttempt ? sumRequired(penalty.xRoles) : sumRequired(currentXRoles);
 
   const passed = submittedCount >= requiredCount;
 
@@ -819,6 +853,7 @@ new SlashCommandBuilder()
     .addChannelOption(opt => opt.setName('raid-channel').setDescription('Channel where admins post raids').setRequired(true))
     .addChannelOption(opt => opt.setName('proof-channel').setDescription('Channel where users submit proof links').setRequired(true))
     .addRoleOption(opt => opt.setName('access-role').setDescription('Role required to post proofs').setRequired(true))
+    .addUserOption(opt => opt.setName('notify-admin').setDescription('Who gets DM\'d for raid issues like missing roles (defaults to you)').setRequired(false))
     .toJSON(),
 
   new SlashCommandBuilder()
@@ -1606,6 +1641,7 @@ if (interaction.commandName === 'removeuserpoints') {
     const raidChannel = interaction.options.getChannel('raid-channel');
     const proofChannel = interaction.options.getChannel('proof-channel');
     const accessRole = interaction.options.getRole('access-role');
+    const notifyAdmin = interaction.options.getUser('notify-admin') || interaction.user;
 
     const settings = loadSettings();
     settings[interaction.guild.id] = {
@@ -1613,11 +1649,12 @@ if (interaction.commandName === 'removeuserpoints') {
       raidChannel: raidChannel.id,
       proofChannel: proofChannel.id,
       accessRole: accessRole.id,
+      notifyAdmin: notifyAdmin.id,
     };
     saveSettings(settings);
 
     return interaction.reply({
-      content: `✅ Raid verification configured:\n• Raid channel: <#${raidChannel.id}>\n• Proof channel: <#${proofChannel.id}>\n• Access Role: <@&${accessRole.id}>\n\nAny message posted in the raid channel by someone with Manage Server permission now opens a new proof window. X role requirements are read from roles named \`Raiders X<N>\` (summed if a user has more than one).`,
+      content: `✅ Raid verification configured:\n• Raid channel: <#${raidChannel.id}>\n• Proof channel: <#${proofChannel.id}>\n• Access Role: <@&${accessRole.id}>\n• Notify: <@${notifyAdmin.id}>\n\nAny message posted in the raid channel by someone with Manage Server permission now opens a new proof window. X role requirements are read from roles named \`Raiders X<N>\` (summed if a user has more than one).`,
       ephemeral: true,
     });
   }
