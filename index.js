@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
+const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, AuditLogEvent } = require('discord.js');
 const fs = require('fs');
 const http = require('http');
 const crypto = require('crypto');
@@ -40,6 +40,8 @@ const WALLET_FILE = 'wallets';
 const RAID_STATE_FILE = 'raidstate';
 const PENALTY_FILE = 'penalties';
 const PENALTY_HOURS = 24;
+const DEFAULT_MIN_ACCOUNT_AGE_DAYS = 7;
+const DEFAULT_MIN_MEMBERSHIP_HOURS = 24;
 const COOLDOWN_SECONDS = 10;
 const cooldowns = new Map();
 const trackerIntervals = new Map();
@@ -493,13 +495,17 @@ async function scheduleKick(userId, remaining) {
 // X Roles are named "Raiders X<N>" (e.g. "Raiders X1", "Raiders X5"). A user's
 // required proof count is the SUM of every matching X role's number.
 //
-// raidstate[guildId] = { timestamp, submitted: { userId: true } }
+// raidstate[guildId] = { timestamp, submitted: { userId: true }, startedBy }
 //   - timestamp resets whenever an admin posts in the configured raid channel
 //   - submitted tracks who has already had their one shot at proof for this raid
 //
 // penalties[guildId][userId] = { xRoles: [{id,name,count}], timestamp, accessRestored }
 //   - xRoles are the previous X roles being held in escrow during the penalty
 //   - accessRestored flips true once the 24h auto-restore has run
+//
+// settings[guildId].raidEnabled — false disables the whole system (kill switch)
+// settings[guildId].minAccountAgeDays / minMembershipHours — anti-alt gate for
+//   first-time raiders, defaults applied if unset
 
 const X_ROLE_REGEX = /^Raiders X(\d+)$/i;
 
@@ -550,6 +556,7 @@ async function handleRaidPost(message) {
   if (!conf?.raidChannel || message.channel.id !== conf.raidChannel) return;
   if (message.author.bot) return;
   if (!message.member.permissions.has('ManageGuild')) return;
+  if (conf.raidEnabled === false) return;
 
   const raidState = loadRaidState();
   raidState[message.guild.id] = { timestamp: Date.now(), submitted: {}, startedBy: message.author.id };
@@ -561,6 +568,7 @@ async function handleProofSubmission(message) {
   const conf = settings[message.guild.id];
   if (!conf?.proofChannel || message.channel.id !== conf.proofChannel) return;
   if (message.author.bot) return;
+  if (conf.raidEnabled === false) return;
 
   const raidState = loadRaidState();
   const raid = raidState[message.guild.id];
@@ -589,10 +597,29 @@ async function handleProofSubmission(message) {
   // instead of running them through the normal pass/fail check (which would
   // read requiredCount as 0 and wrongly "pass" them with nothing granted).
   // No congrats/pending DM goes to the raider — reactions only. The configured
-  // notify-admin gets pinged only when a matching Raiders X<N> role is missing.
+  // notify-admin gets pinged only when a matching Raiders X<N> role is missing
+  // OR when the account looks like a likely alt (see gate below).
   if (!isReclaimAttempt && currentXRoles.length === 0) {
     if (submittedCount === 0) {
       try { await message.react('❌'); } catch {}
+      return;
+    }
+
+    // Anti-alt gate: a brand new Discord account, or one that just joined the
+    // server, dropping proof once to snag a role is the exact pattern getting
+    // gamed. Block the auto-grant and flag it instead of silently rewarding it.
+    const minAccountAgeDays = conf.minAccountAgeDays ?? DEFAULT_MIN_ACCOUNT_AGE_DAYS;
+    const minMembershipHours = conf.minMembershipHours ?? DEFAULT_MIN_MEMBERSHIP_HOURS;
+    const accountAgeDays = (Date.now() - member.user.createdTimestamp) / (24 * 60 * 60 * 1000);
+    const membershipHours = (Date.now() - member.joinedTimestamp) / (60 * 60 * 1000);
+
+    if (accountAgeDays < minAccountAgeDays || membershipHours < minMembershipHours) {
+      try { await message.react('🚩'); } catch {}
+      if (conf.notifyAdmin) {
+        await dmSafe(conf.notifyAdmin, {
+          content: `🚩 Flagged possible alt in **${message.guild.name}**: <@${member.id}> dropped **${submittedCount}** link(s) as a first-time raider, but their account is **${accountAgeDays.toFixed(1)}d** old and they joined **${membershipHours.toFixed(1)}h** ago (thresholds: ${minAccountAgeDays}d account / ${minMembershipHours}h membership). No roles were granted — use \`/clearpenalty\` won't apply here, they just never got roles. Grant manually if this is legit.`,
+        });
+      }
       return;
     }
 
@@ -694,6 +721,55 @@ async function runPenaltyRestoreSweep() {
       }
     }
   }
+}
+
+// ─── Role Restore (audit-log based) ─────────────────────────────────────────────
+//
+// Pulls Discord's own audit log (MemberRoleUpdate entries), aggregates every
+// role that got REMOVED from anyone within a time window, and lets an admin
+// re-add them all in one confirmed action. Additions are never undone — only
+// removals get reversed. Held in memory only (short-lived confirm flow),
+// cleared after use or after 10 minutes if nobody confirms.
+
+const pendingRestores = new Map();
+
+async function collectRemovedRoles(guild, sinceTimestamp) {
+  const removedByUser = new Map(); // userId -> Map(roleId -> {id, name})
+  let before;
+  let batches = 0;
+  const MAX_BATCHES = 10; // safety cap: up to 1000 audit log entries scanned
+
+  while (batches < MAX_BATCHES) {
+    const logs = await guild.fetchAuditLogs({
+      type: AuditLogEvent.MemberRoleUpdate,
+      limit: 100,
+      before,
+    });
+    const entries = [...logs.entries.values()];
+    if (entries.length === 0) break;
+
+    for (const entry of entries) {
+      if (entry.createdTimestamp < sinceTimestamp) {
+        return removedByUser; // hit entries older than our window, stop entirely
+      }
+      const removeChange = entry.changes?.find(c => c.key === '$remove');
+      if (!removeChange || !Array.isArray(removeChange.new)) continue;
+      const targetId = entry.targetId;
+      if (!targetId) continue;
+
+      if (!removedByUser.has(targetId)) removedByUser.set(targetId, new Map());
+      const roleMap = removedByUser.get(targetId);
+      for (const role of removeChange.new) {
+        roleMap.set(role.id, { id: role.id, name: role.name });
+      }
+    }
+
+    before = entries[entries.length - 1].id;
+    batches++;
+    if (entries.length < 100) break; // no more pages
+  }
+
+  return removedByUser;
 }
 
 // ─── Slash Commands ───────────────────────────────────────────────────────────
@@ -854,6 +930,14 @@ new SlashCommandBuilder()
     .addChannelOption(opt => opt.setName('proof-channel').setDescription('Channel where users submit proof links').setRequired(true))
     .addRoleOption(opt => opt.setName('access-role').setDescription('Role required to post proofs').setRequired(true))
     .addUserOption(opt => opt.setName('notify-admin').setDescription('Who gets DM\'d for raid issues like missing roles (defaults to you)').setRequired(false))
+    .addIntegerOption(opt => opt.setName('min-account-age-days').setDescription('Min Discord account age (days) for a first-time raider to auto-qualify. Default 7').setRequired(false).setMinValue(0))
+    .addIntegerOption(opt => opt.setName('min-membership-hours').setDescription('Min time in this server (hours) for a first-time raider to auto-qualify. Default 24').setRequired(false).setMinValue(0))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('toggleraid')
+    .setDescription('Turn the raid verification system on or off')
+    .addBooleanOption(opt => opt.setName('enabled').setDescription('Leave blank to just flip the current state').setRequired(false))
     .toJSON(),
 
   new SlashCommandBuilder()
@@ -865,6 +949,12 @@ new SlashCommandBuilder()
     .setName('clearpenalty')
     .setDescription('Manually clear a user\'s raid penalty and restore their roles')
     .addUserOption(opt => opt.setName('user').setDescription('User to clear').setRequired(true))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('restoreroles')
+    .setDescription('Reverse role removals from the server audit log within a time window')
+    .addIntegerOption(opt => opt.setName('hours').setDescription('How far back to look (default 48)').setRequired(false).setMinValue(1).setMaxValue(720))
     .toJSON(),
 ];
 
@@ -966,6 +1056,56 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.respond(matches);
     }
     return;
+  }
+
+  // ── Role Restore: Confirm/Cancel ──
+  if (interaction.isButton() && (interaction.customId.startsWith('restore_confirm:') || interaction.customId.startsWith('restore_cancel:'))) {
+    const [action, token] = interaction.customId.split(':');
+    const pending = pendingRestores.get(token);
+
+    if (!pending) {
+      return interaction.update({ content: 'This restore request expired or was already handled. Run `/restoreroles` again.', embeds: [], components: [] });
+    }
+    if (interaction.user.id !== pending.requestedBy) {
+      return interaction.reply({ content: 'Only the admin who ran `/restoreroles` can confirm or cancel this.', ephemeral: true });
+    }
+
+    pendingRestores.delete(token);
+
+    if (action === 'restore_cancel') {
+      return interaction.update({ content: 'Cancelled. No roles were changed.', embeds: [], components: [] });
+    }
+
+    await interaction.update({ content: '⏳ Restoring roles, this may take a moment...', embeds: [], components: [] });
+
+    let usersRestored = 0;
+    let rolesRestored = 0;
+    const failures = [];
+
+    for (const [userId, roles] of pending.removedByUser.entries()) {
+      try {
+        const member = await interaction.guild.members.fetch(userId);
+        let userHadSuccess = false;
+        for (const role of roles.values()) {
+          try {
+            await member.roles.add(role.id);
+            rolesRestored++;
+            userHadSuccess = true;
+          } catch {
+            failures.push(`${role.name} → <@${userId}>`);
+          }
+        }
+        if (userHadSuccess) usersRestored++;
+      } catch {
+        failures.push(`(member left server) → <@${userId}>`);
+      }
+    }
+
+    let summary = `✅ Restored **${rolesRestored}** role grant(s) across **${usersRestored}** user(s).`;
+    if (failures.length > 0) {
+      summary += `\n⚠️ **${failures.length}** failed (role deleted, or bot's role isn't above it): ${failures.slice(0, 10).join(', ')}${failures.length > 10 ? '...' : ''}`;
+    }
+    return interaction.followUp({ content: summary, ephemeral: true });
   }
 
   // ── Leaderboard: Back/Forward pagination ──
@@ -1642,19 +1782,50 @@ if (interaction.commandName === 'removeuserpoints') {
     const proofChannel = interaction.options.getChannel('proof-channel');
     const accessRole = interaction.options.getRole('access-role');
     const notifyAdmin = interaction.options.getUser('notify-admin') || interaction.user;
+    const minAccountAgeDays = interaction.options.getInteger('min-account-age-days');
+    const minMembershipHours = interaction.options.getInteger('min-membership-hours');
 
     const settings = loadSettings();
+    const existing = settings[interaction.guild.id] || {};
     settings[interaction.guild.id] = {
-      ...settings[interaction.guild.id],
+      ...existing,
       raidChannel: raidChannel.id,
       proofChannel: proofChannel.id,
       accessRole: accessRole.id,
       notifyAdmin: notifyAdmin.id,
+      minAccountAgeDays: minAccountAgeDays ?? existing.minAccountAgeDays ?? DEFAULT_MIN_ACCOUNT_AGE_DAYS,
+      minMembershipHours: minMembershipHours ?? existing.minMembershipHours ?? DEFAULT_MIN_MEMBERSHIP_HOURS,
     };
     saveSettings(settings);
 
+    const finalConf = settings[interaction.guild.id];
     return interaction.reply({
-      content: `✅ Raid verification configured:\n• Raid channel: <#${raidChannel.id}>\n• Proof channel: <#${proofChannel.id}>\n• Access Role: <@&${accessRole.id}>\n• Notify: <@${notifyAdmin.id}>\n\nAny message posted in the raid channel by someone with Manage Server permission now opens a new proof window. X role requirements are read from roles named \`Raiders X<N>\` (summed if a user has more than one).`,
+      content: `✅ Raid verification configured:\n• Raid channel: <#${raidChannel.id}>\n• Proof channel: <#${proofChannel.id}>\n• Access Role: <@&${accessRole.id}>\n• Notify: <@${notifyAdmin.id}>\n• Min account age: **${finalConf.minAccountAgeDays}d** • Min membership: **${finalConf.minMembershipHours}h** (first-time raiders under either get flagged 🚩 instead of auto-granted roles)\n\nAny message posted in the raid channel by someone with Manage Server permission now opens a new proof window. X role requirements are read from roles named \`Raiders X<N>\` (summed if a user has more than one).`,
+      ephemeral: true,
+    });
+  }
+
+  // ── /toggleraid ──
+  if (interaction.commandName === 'toggleraid') {
+    if (!interaction.member.permissions.has('ManageGuild')) {
+      return interaction.reply({ content: 'You need Manage Server permission.', ephemeral: true });
+    }
+    const settings = loadSettings();
+    const existing = settings[interaction.guild.id];
+    if (!existing?.raidChannel) {
+      return interaction.reply({ content: 'Raid verification isn\'t configured yet. Run `/setraidconfig` first.', ephemeral: true });
+    }
+    const currentlyEnabled = existing.raidEnabled !== false;
+    const explicit = interaction.options.getBoolean('enabled');
+    const newState = explicit !== null ? explicit : !currentlyEnabled;
+
+    settings[interaction.guild.id] = { ...existing, raidEnabled: newState };
+    saveSettings(settings);
+
+    return interaction.reply({
+      content: newState
+        ? '✅ Raid verification is back **ON**. New raid posts will open proof windows again.'
+        : '⛔ Raid verification is now **OFF**. Raid posts and proof submissions will be ignored until this is turned back on.',
       ephemeral: true,
     });
   }
@@ -1671,7 +1842,7 @@ if (interaction.commandName === 'removeuserpoints') {
     const penalties = loadPenalties()[guildId] || {};
     const penaltyEntries = Object.entries(penalties);
 
-    let msg = `**Raid Channel:** <#${conf.raidChannel}>\n**Proof Channel:** <#${conf.proofChannel}>\n**Access Role:** <@&${conf.accessRole}>\n\n`;
+    let msg = `**Status:** ${conf.raidEnabled === false ? '⛔ OFF' : '✅ ON'}\n**Raid Channel:** <#${conf.raidChannel}>\n**Proof Channel:** <#${conf.proofChannel}>\n**Access Role:** <@&${conf.accessRole}>\n**Anti-alt gate:** ${conf.minAccountAgeDays ?? DEFAULT_MIN_ACCOUNT_AGE_DAYS}d account / ${conf.minMembershipHours ?? DEFAULT_MIN_MEMBERSHIP_HOURS}h membership\n\n`;
     if (raid?.timestamp) {
       const submittedCount = Object.keys(raid.submitted || {}).length;
       msg += `**Current raid window:** started <t:${Math.floor(raid.timestamp / 1000)}:R>, ${submittedCount} submission(s) so far.\n\n`;
@@ -1721,6 +1892,55 @@ if (interaction.commandName === 'removeuserpoints') {
     await dmSafe(user.id, { content: `Your raid penalty in **${interaction.guild.name}** was manually cleared by an admin. Your roles have been restored.` });
 
     return interaction.reply({ content: `Cleared penalty for **${user.username}** and restored their roles.`, ephemeral: true });
+  }
+
+  // ── /restoreroles ──
+  if (interaction.commandName === 'restoreroles') {
+    if (!interaction.member.permissions.has('ManageGuild')) {
+      return interaction.reply({ content: 'You need Manage Server permission.', ephemeral: true });
+    }
+    const botMember = interaction.guild.members.me;
+    if (!botMember.permissions.has('ViewAuditLog')) {
+      return interaction.reply({ content: 'I need the **View Audit Log** permission to do this — grant it to my role and try again.', ephemeral: true });
+    }
+    if (!botMember.permissions.has('ManageRoles')) {
+      return interaction.reply({ content: 'I need the **Manage Roles** permission to restore anything.', ephemeral: true });
+    }
+
+    const hours = interaction.options.getInteger('hours') || 48;
+    await interaction.deferReply({ ephemeral: true });
+
+    const sinceTimestamp = Date.now() - hours * 60 * 60 * 1000;
+    const removedByUser = await collectRemovedRoles(interaction.guild, sinceTimestamp);
+
+    if (removedByUser.size === 0) {
+      return interaction.editReply(`No role removals found in the audit log for the last **${hours}** hours.`);
+    }
+
+    let totalRoles = 0;
+    const lines = [];
+    for (const [userId, roles] of removedByUser.entries()) {
+      totalRoles += roles.size;
+      const roleNames = [...roles.values()].map(r => r.name).join(', ');
+      lines.push(`<@${userId}> — ${roleNames}`);
+    }
+
+    const token = crypto.randomBytes(8).toString('hex');
+    pendingRestores.set(token, { removedByUser, requestedBy: interaction.user.id });
+    setTimeout(() => pendingRestores.delete(token), 10 * 60 * 1000); // expire after 10 min
+
+    const embed = new EmbedBuilder()
+      .setColor(0xF1C40F)
+      .setTitle('⚠️ Confirm Role Restore')
+      .setDescription(`Found **${totalRoles}** role removal(s) across **${removedByUser.size}** user(s) in the last **${hours}** hours.\n\n${lines.slice(0, 20).join('\n')}${lines.length > 20 ? `\n...and ${lines.length - 20} more` : ''}`)
+      .setFooter({ text: 'This only re-adds removed roles — role additions in this window are left untouched.' });
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`restore_confirm:${token}`).setLabel('Restore All').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`restore_cancel:${token}`).setLabel('Cancel').setStyle(ButtonStyle.Danger),
+    );
+
+    return interaction.editReply({ embeds: [embed], components: [row] });
   }
 });
 
