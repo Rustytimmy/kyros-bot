@@ -71,8 +71,10 @@ async function persist(key, data) {
        ON CONFLICT (key) DO UPDATE SET value = $2`,
       [key, JSON.stringify(data)]
     );
+    return true;
   } catch (e) {
     console.error(`Failed to persist key "${key}":`, e.message);
+    return false;
   }
 }
 
@@ -82,9 +84,13 @@ function load(file) {
   return cache[file] || {};
 }
 
+// Returns a promise resolving true/false. Fire-and-forget for low-stakes saves
+// (settings, trackers, wallets); money/inventory-critical call sites should
+// `await save(...)` (or `await persist(...)` again after several sync saves)
+// and warn the user if it resolves false, since the write never throws.
 function save(file, data) {
   cache[file] = data; // update cache synchronously so next load() sees it immediately
-  persist(file, data); // write to Postgres async in background
+  return persist(file, data); // write to Postgres async in background
 }
 
 function loadPending() { return load(DB_FILE); }
@@ -106,6 +112,16 @@ function savePenalties(d) { save(PENALTY_FILE, d); }
 
 function getDefaultChannel(guildId) {
   return loadSettings()[guildId]?.defaultChannel || null;
+}
+
+// Escapes a value for safe use as one CSV field: neutralizes leading =/+/-/@
+// (formula injection if opened in Excel/Sheets) and quotes anything with a
+// comma, quote, or newline.
+function csvField(value) {
+  let s = String(value ?? '');
+  if (/^[=+\-@]/.test(s)) s = `'${s}`;
+  if (/[",\n]/.test(s)) s = `"${s.replace(/"/g, '""')}"`;
+  return s;
 }
 
 // ─── Memory Bot Leaderboard Sync ───────────────────────────────────────────────
@@ -559,7 +575,7 @@ async function handleRaidPost(message) {
   if (conf.raidEnabled === false) return;
 
   const raidState = loadRaidState();
-  raidState[message.guild.id] = { timestamp: Date.now(), submitted: {}, startedBy: message.author.id };
+  raidState[message.guild.id] = { timestamp: Date.now(), submitted: {}, usedLinks: [], startedBy: message.author.id };
   saveRaidState(raidState);
 }
 
@@ -580,12 +596,18 @@ async function handleProofSubmission(message) {
   // since we only listen on messageCreate, and resubmissions are blocked here.
   if (raid.submitted[message.author.id]) return;
   raid.submitted[message.author.id] = true;
-  saveRaidState(raidState);
 
   const member = message.member;
   const guildId = message.guild.id;
   const links = extractTwitterLinks(message.content);
-  const submittedCount = links.length;
+
+  // A link already credited to someone else in this raid doesn't count again —
+  // otherwise everyone can pad their count by reposting the same tweet URL.
+  const alreadyUsed = new Set((raid.usedLinks || []).map(l => l.toLowerCase()));
+  const newLinks = links.filter(l => !alreadyUsed.has(l.toLowerCase()));
+  const submittedCount = newLinks.length;
+  raid.usedLinks = [...(raid.usedLinks || []), ...newLinks];
+  saveRaidState(raidState);
 
   const penalty = getPenalty(guildId, member.id);
   const isReclaimAttempt = !!penalty;
@@ -732,6 +754,7 @@ async function runPenaltyRestoreSweep() {
 // cleared after use or after 10 minutes if nobody confirms.
 
 const pendingRestores = new Map();
+const pendingNukes = new Map();
 
 async function collectRemovedRoles(guild, sinceTimestamp) {
   const removedByUser = new Map(); // userId -> Map(roleId -> {id, name})
@@ -1108,6 +1131,43 @@ client.on('interactionCreate', async (interaction) => {
     return interaction.followUp({ content: summary, ephemeral: true });
   }
 
+  // ── /nuke: Confirm/Cancel ──
+  if (interaction.isButton() && (interaction.customId.startsWith('nuke_confirm:') || interaction.customId.startsWith('nuke_cancel:'))) {
+    const [action, token] = interaction.customId.split(':');
+    const pending = pendingNukes.get(token);
+
+    if (!pending) {
+      return interaction.update({ content: 'This kick request expired or was already handled. Run `/nuke` again.', embeds: [], components: [] });
+    }
+    if (interaction.user.id !== pending.requestedBy) {
+      return interaction.reply({ content: 'Only the admin who ran `/nuke` can confirm or cancel this.', ephemeral: true });
+    }
+
+    pendingNukes.delete(token);
+
+    if (action === 'nuke_cancel') {
+      return interaction.update({ content: 'Cancelled. No one was kicked.', embeds: [], components: [] });
+    }
+
+    await interaction.update({ content: '⏳ Kicking...', embeds: [], components: [] });
+
+    let kicked = 0;
+    const failures = [];
+    for (const id of pending.toKick) {
+      try {
+        const member = await interaction.guild.members.fetch(id);
+        await member.kick(`Inactive for ${pending.days}+ days`);
+        kicked++;
+      } catch {
+        failures.push(id);
+      }
+    }
+
+    let summary = `Done. Kicked **${kicked}** inactive member(s).`;
+    if (failures.length > 0) summary += ` **${failures.length}** failed (already left, or I'm missing permission).`;
+    return interaction.followUp({ content: summary });
+  }
+
   // ── Leaderboard: Back/Forward pagination ──
   if (interaction.isButton() && interaction.customId.startsWith('lb_page:')) {
     const [, guildId, pageStr] = interaction.customId.split(':');
@@ -1148,10 +1208,15 @@ client.on('interactionCreate', async (interaction) => {
 
     if (!item) return interaction.update({ content: 'This item no longer exists.', components: [] });
 
-    const spotsLeft = item.spots === -1 ? Infinity : item.spots - (item.claimedBy?.length || 0);
+    // Every check below, and the claim/charge itself, run synchronously with no
+    // `await` in between. That's what makes this atomic: a second purchase attempt
+    // (double-click, or a race for the last spot) can't be interleaved by the event
+    // loop until after this reservation is already committed to `market`.
+    if (!item.claimedBy) item.claimedBy = [];
+    const spotsLeft = item.spots === -1 ? Infinity : item.spots - item.claimedBy.length;
     if (spotsLeft <= 0) return interaction.update({ content: 'This item is sold out.', components: [] });
 
-    if ((item.claimedBy || []).includes(interaction.user.id)) {
+    if (item.claimedBy.includes(interaction.user.id)) {
       return interaction.update({ content: 'You already redeemed this item.', components: [] });
     }
 
@@ -1160,17 +1225,22 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.update({ content: `You need **${item.cost}** points. You have **${pts}**.`, components: [] });
     }
 
+    item.claimedBy.push(interaction.user.id);
+    saveMarket(market);
+    deductPoints(interaction.guild.id, interaction.user.id, item.cost);
+
+    const marketPersisted = await persist(MARKET_FILE, market);
+    const pointsPersisted = await persist(POINTS_FILE, loadPoints());
+
     try {
       const member = await interaction.guild.members.fetch(interaction.user.id);
       await member.roles.add(item.roleId);
-      deductPoints(interaction.guild.id, interaction.user.id, item.cost);
-
-      if (!item.claimedBy) item.claimedBy = [];
-      item.claimedBy.push(interaction.user.id);
-      saveMarket(market);
       await postOrUpdateMarket(interaction.guild.id);
 
-      await interaction.update({ content: `✅ Redeemed **${item.name}**! You've been given <@&${item.roleId}> and **${item.cost}** points were deducted.`, components: [] });
+      const warning = (!marketPersisted || !pointsPersisted)
+        ? '\n⚠️ Database write had an error — if your balance looks wrong later, ping an admin.'
+        : '';
+      await interaction.update({ content: `✅ Redeemed **${item.name}**! You've been given <@&${item.roleId}> and **${item.cost}** points were deducted.${warning}`, components: [] });
 
       // Immediately follow up asking for their wallet, tied to this specific item
       try {
@@ -1187,7 +1257,17 @@ client.on('interactionCreate', async (interaction) => {
 
       return;
     } catch (e) {
-      return interaction.update({ content: 'Failed to assign role. Make sure the bot has Manage Roles permission and its role is above the item role.', components: [] });
+      // Role grant failed — roll back the reservation and refund the points.
+      const rollbackMarket = loadMarket();
+      const rollbackItem = rollbackMarket[interaction.guild.id]?.items?.[itemId];
+      if (rollbackItem) {
+        rollbackItem.claimedBy = (rollbackItem.claimedBy || []).filter(id => id !== interaction.user.id);
+        saveMarket(rollbackMarket);
+      }
+      const rec = getUserRecord(interaction.guild.id, interaction.user.id);
+      rec.balance += item.cost;
+      saveUserRecord(interaction.guild.id, interaction.user.id, rec);
+      return interaction.update({ content: 'Failed to assign role. Make sure the bot has Manage Roles permission and its role is above the item role. Your points have been refunded.', components: [] });
     }
   }
 
@@ -1268,15 +1348,35 @@ client.on('interactionCreate', async (interaction) => {
         }
       } catch {}
     }
-    let kicked = 0;
+    const toKick = [];
     for (const [id, member] of members) {
       if (member.user.bot) continue;
       const seen = lastSeen.get(id) || 0;
-      if (seen < cutoff) {
-        try { await member.kick(`Inactive for ${days}+ days`); kicked++; } catch {}
-      }
+      if (seen < cutoff) toKick.push(id);
     }
-    return interaction.editReply(`Done. Kicked ${kicked} inactive members.`);
+
+    if (toKick.length === 0) {
+      return interaction.editReply(`No members look inactive for ${days}+ days (based on the last 100 messages in each channel I can read).`);
+    }
+
+    const token = crypto.randomBytes(8).toString('hex');
+    pendingNukes.set(token, { toKick, days, requestedBy: interaction.user.id });
+    setTimeout(() => pendingNukes.delete(token), 10 * 60 * 1000);
+
+    const preview = toKick.slice(0, 20).map(id => `<@${id}>`).join(', ') + (toKick.length > 20 ? `, and ${toKick.length - 20} more` : '');
+
+    const embed = new EmbedBuilder()
+      .setColor(0xE74C3C)
+      .setTitle('⚠️ Confirm Kick')
+      .setDescription(`**${toKick.length}** member(s) haven't posted in the last **100** messages of any channel I can read, in the last **${days}** day(s):\n\n${preview}`)
+      .setFooter({ text: 'Heuristic based on recent channel history only — high-traffic channels can push an active member\'s last message out of that window. Review before confirming.' });
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`nuke_confirm:${token}`).setLabel(`Kick ${toKick.length}`).setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId(`nuke_cancel:${token}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+    );
+
+    return interaction.editReply({ content: null, embeds: [embed], components: [row] });
   }
 
   // ── /setchannel ──
@@ -1392,7 +1492,7 @@ client.on('interactionCreate', async (interaction) => {
         username = user.username;
       } catch {}
       for (const [chain, address] of Object.entries(chains)) {
-        rows.push(`${username},${userId},${chain},${address}`);
+        rows.push([username, userId, chain, address].map(csvField).join(','));
       }
     }
 
@@ -1433,7 +1533,7 @@ client.on('interactionCreate', async (interaction) => {
         const user = await client.users.fetch(userId);
         username = user.username;
       } catch {}
-      rows.push(`${username},${userId},${w.chain},${w.address}`);
+      rows.push([username, userId, w.chain, w.address].map(csvField).join(','));
     }
 
     const csvContent = rows.join('\n');
@@ -1655,7 +1755,9 @@ if (label.length > 100) {
     const user = interaction.options.getUser('user');
     const amount = interaction.options.getInteger('amount');
     const newTotal = addPoints(interaction.guild.id, user.id, amount);
-    return interaction.reply(`Added **${amount}** points to **${user.username}**. New balance: **${newTotal}**.`);
+    const persisted = await persist(POINTS_FILE, loadPoints());
+    const warning = persisted ? '' : '\n⚠️ Database write failed — this may not survive a restart. Check the logs.';
+    return interaction.reply(`Added **${amount}** points to **${user.username}**. New balance: **${newTotal}**.${warning}`);
   }
 
 if (interaction.commandName === 'removeuserpoints') {
@@ -1669,7 +1771,9 @@ if (interaction.commandName === 'removeuserpoints') {
     const rec = getUserRecord(interaction.guild.id, user.id);
     rec.lifetime = Math.max(0, rec.lifetime - amount);
     saveUserRecord(interaction.guild.id, user.id, rec);
-    return interaction.reply({ content: `Removed **${amount}** points from **${user.username}**. New balance: **${newBalance}**.`, ephemeral: true });
+    const persisted = await persist(POINTS_FILE, loadPoints());
+    const warning = persisted ? '' : '\n⚠️ Database write failed — this may not survive a restart. Check the logs.';
+    return interaction.reply({ content: `Removed **${amount}** points from **${user.username}**. New balance: **${newBalance}**.${warning}`, ephemeral: true });
 }
 
   // ── /importpoints ──
@@ -1727,11 +1831,14 @@ if (interaction.commandName === 'removeuserpoints') {
         }
       }
 
+      const persisted = await persist(POINTS_FILE, loadPoints());
+
       let summary = `✅ Synced **${synced}** users with new points credited to their balance.`;
       if (noChange > 0) summary += `\n➖ **${noChange}** users had no change (already up to date).`;
       if (notFound.length > 0) {
         summary += `\n⚠️ Could not match **${notFound.length}** username(s) to a server member: ${notFound.slice(0, 15).join(', ')}${notFound.length > 15 ? '...' : ''}`;
       }
+      if (!persisted) summary += `\n⚠️ Database write failed — the numbers above updated in memory but may not survive a restart. Re-run \`/importpoints\` to be safe.`;
 
       return interaction.editReply(summary);
     } catch (e) {
@@ -1758,9 +1865,9 @@ if (interaction.commandName === 'removeuserpoints') {
       const r = getUserRecord(interaction.guild.id, userId);
       try {
         const user = await client.users.fetch(userId);
-        rows.push(`${user.username},${r.lifetime},${r.balance}`);
+        rows.push([user.username, r.lifetime, r.balance].map(csvField).join(','));
       } catch {
-        rows.push(`${userId},${r.lifetime},${r.balance}`);
+        rows.push([userId, r.lifetime, r.balance].map(csvField).join(','));
       }
     }
 
